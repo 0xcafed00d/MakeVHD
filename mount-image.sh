@@ -48,6 +48,19 @@ cleanup_on_error() {
     fi
 }
 
+# Older BusyBox losetup lacks the GNU-style --find/--show/--partscan flags,
+# so try the newer form first and fall back to -f plus -P.
+attach_loop_with_partscan() {
+    if loopdev=$(losetup --find --show --partscan "$image_path" 2>/dev/null); then
+        printf '%s\n' "$loopdev"
+        return 0
+    fi
+
+    loopdev=$(losetup -f)
+    losetup -P "$loopdev" "$image_path"
+    printf '%s\n' "$loopdev"
+}
+
 trap cleanup_on_error ERR
 
 case "${image_path##*.}" in
@@ -58,7 +71,7 @@ case "${image_path##*.}" in
         ;;
 
     vhd|VHD)
-        loopdev=$(losetup --find --show --partscan "$image_path")
+        loopdev=$(attach_loop_with_partscan)
         partdev="${loopdev}p1"
 
         if [[ ! -b "$partdev" ]]; then
