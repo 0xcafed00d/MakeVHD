@@ -20,5 +20,7 @@ cd "$repo_root"
 build_target "makevhd-linux-amd64" env CGO_ENABLED=0 GOOS=linux GOARCH=amd64
 build_target "makevhd-linux-armv7" env CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7
 build_target "makevhd-linux-arm64" env CGO_ENABLED=0 GOOS=linux GOARCH=arm64
+build_target "makevhd-windows-amd64.exe" env CGO_ENABLED=0 GOOS=windows GOARCH=amd64
 
 cp mount-image.sh "$dist_dir/"
+cp mount-image.ps1 "$dist_dir/"

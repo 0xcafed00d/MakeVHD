@@ -74,14 +74,35 @@ Creates a fixed VHD:
 
 Builds binaries into `dist/` for:
 
-- the native host platform as `dist/makevhd`
+- Linux AMD64 as `dist/makevhd-linux-amd64`
 - Linux ARM 32-bit as `dist/makevhd-linux-armv7`
 - Linux ARM 64-bit as `dist/makevhd-linux-arm64`
+- Windows AMD64 as `dist/makevhd-windows-amd64.exe`
 
 Run:
 
 ```bash
 ./build.sh
+```
+
+The build copies both mount helper scripts into `dist/`:
+
+- `mount-image.sh`
+- `mount-image.ps1`
+
+### `build.cmd`
+
+Builds the same artifact set on Windows:
+
+- `dist\makevhd-linux-amd64`
+- `dist\makevhd-linux-armv7`
+- `dist\makevhd-linux-arm64`
+- `dist\makevhd-windows-amd64.exe`
+
+Run from `cmd.exe`:
+
+```bat
+build.cmd
 ```
 
 ### `mount-image.sh`
@@ -101,6 +122,23 @@ Behavior:
 - `.vhd`: attached with `losetup --partscan` and mounts partition `1`
 
 The script prints the unmount command after a successful mount.
+
+### `mount-image.ps1`
+
+Mounts `.vhd` images produced by this project on Windows using PowerShell and the built-in Storage module.
+
+Run from an elevated PowerShell session:
+
+```powershell
+.\mount-image.ps1 .\disk.vhd C:\mnt\disk
+```
+
+Behavior:
+
+- `.vhd`: attached with `Mount-DiskImage` and exposed at the requested NTFS folder mount point
+- `.img`: not supported natively on Windows and rejected by the script
+
+The script prints the dismount command after a successful mount.
 
 ## Testing
 
