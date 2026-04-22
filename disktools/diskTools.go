@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -29,6 +28,22 @@ const vhdPartitionStartLBA = 2048
 const partitionTypeFAT12 = 0x01
 const partitionTypeFAT16LBA = 0x0e
 const partitionTypeFAT32LBA = 0x0c
+const fatReservedSectors12_16 = 4
+const fatReservedSectors32 = 32
+const fatCount = 2
+const fatRootEntryCount = 512
+const fatRootCluster = 2
+const fat32FSInfoSector = 1
+const fat32BackupBootSector = 6
+const fatMediaFixedDisk = 0xf8
+const fatExtBootSignature = 0x29
+const fatTypeThreshold12 = 4085
+const fatTypeThreshold16 = 65525
+const fat32EndOfChain = 0x0fffffff
+const fatBootOEMName = "MSDOS5.0"
+const fatVolumeLabel = "NO NAME    "
+const fatFSInfoLeadSignature = 0x41615252
+const fatFSInfoStructSignature = 0x61417272
 const vhdFooterSize = 512
 const vhdSectorSize = 512
 const vhdFooterCookie = "conectix"
@@ -54,17 +69,24 @@ type partitionLayout struct {
 	partitionType    byte
 }
 
-type fileRegion struct {
-	offset int64
-	length int64
-}
-
-type fatMetadataLayout struct {
-	bytesPerSector    uint16
+type fatFormat struct {
+	fatBits           int
+	totalSectors      uint32
+	hiddenSectors     uint32
+	volumeOffset      int64
 	sectorsPerCluster uint8
-	regions           []fileRegion
+	reservedSectors   uint16
+	sectorsPerFAT     uint32
+	rootEntryCount    uint16
+	rootDirSectors    uint32
+	firstDataSector   uint32
+	clusterCount      uint32
+	sectorsPerTrack   uint16
+	headCount         uint16
+	volumeID          uint32
 }
 
+// MakeVHD creates either a FAT-formatted superfloppy IMG or a fixed VHD.
 func MakeVHD(filename string, size int) error {
 	imageType, err := imageTypeFromFilename(filename)
 	if err != nil {
@@ -97,8 +119,7 @@ func MakeVHD(filename string, size int) error {
 	return nil
 }
 
-// create a blank disk image file of the specified size (in MB)
-// the image will be formatted as a raw disk image (i.e. no partition table or filesystem)
+// CreateImage creates a blank image file at the requested size.
 func CreateImage(filename string, size int) (err error) {
 	if err := validateImageSpec(filename, size); err != nil {
 		return err
@@ -144,24 +165,24 @@ func FormatImage(filename string, size int) error {
 		return fmt.Errorf("image file %q is not a regular file", filename)
 	}
 
-	mkfsPath, err := findMkfsFAT()
-	if err != nil {
-		return err
-	}
-
 	wantSize := int64(size) * bytesPerMB
-	args := []string{"--invariant"}
+	file, err := os.OpenFile(filename, os.O_RDWR, 0)
+	if err != nil {
+		return fmt.Errorf("open image file %q: %w", filename, err)
+	}
+	defer file.Close()
 
+	var format fatFormat
 	switch imageType {
 	case imageExtIMG:
 		if info.Size() != wantSize {
 			return fmt.Errorf("image file %q has size %d bytes, want %d bytes", filename, info.Size(), wantSize)
 		}
 
-		args = append(args,
-			"-F", fmt.Sprintf("%d", fatBitsForSize(size)),
-			filename,
-		)
+		format, err = makeFATFormat(info.Size(), fatBitsForSize(size), 0, 0)
+		if err != nil {
+			return err
+		}
 	case imageExtVHD:
 		layout, err := layoutForVHD(size)
 		if err != nil {
@@ -172,249 +193,373 @@ func FormatImage(filename string, size int) error {
 			return fmt.Errorf("image file %q has size %d bytes, want %d bytes", filename, info.Size(), layout.rawSize)
 		}
 
-		if err := formatPartitionedVHD(filename, mkfsPath, layout); err != nil {
-			return fmt.Errorf("format image %q: %w", filename, err)
+		format, err = makeFATFormat(
+			int64(layout.partitionSectors)*vhdSectorSize,
+			layout.fatBits,
+			layout.startLBA,
+			int64(layout.startLBA)*vhdSectorSize,
+		)
+		if err != nil {
+			return err
 		}
-		return nil
 	default:
 		return fmt.Errorf("unsupported image type %q", imageType)
 	}
 
-	cmd := exec.Command(mkfsPath, args...)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("format image %q: %w: %s", filename, err, output)
+	if err := writeFATVolume(file, format); err != nil {
+		return fmt.Errorf("format image %q: %w", filename, err)
 	}
 
 	return nil
 }
 
-func formatPartitionedVHD(filename, mkfsPath string, layout partitionLayout) error {
-	args := []string{
-		"--invariant",
-		"-F", fmt.Sprintf("%d", layout.fatBits),
-		"--offset", fmt.Sprintf("%d", layout.startLBA),
-		"-h", fmt.Sprintf("%d", layout.startLBA),
-		filename,
+// makeFATFormat derives the FAT layout parameters for a volume.
+func makeFATFormat(volumeSizeBytes int64, fatBits int, hiddenSectors uint32, volumeOffset int64) (fatFormat, error) {
+	var format fatFormat
+
+	if volumeSizeBytes <= 0 {
+		return format, errors.New("volume size must be greater than 0")
 	}
 
-	output, err := runMkfsCommand(mkfsPath, args)
-	if err == nil {
-		return nil
+	if volumeSizeBytes%vhdSectorSize != 0 {
+		return format, fmt.Errorf("volume size %d is not a multiple of %d bytes", volumeSizeBytes, vhdSectorSize)
 	}
 
-	if !mkfsOffsetUnsupported(output) {
-		return fmt.Errorf("%w: %s", err, output)
-	}
+	totalSectors := uint32(volumeSizeBytes / vhdSectorSize)
+	sectorsPerCluster := initialSectorsPerCluster(fatBits, totalSectors)
+	sectorsPerTrack, headCount := defaultBPBGeometry(totalSectors, fatBits)
 
-	if err := formatPartitionedVHDFallback(filename, mkfsPath, layout); err != nil {
-		return fmt.Errorf("mkfs.fat without --offset fallback failed: %w", err)
-	}
-
-	return nil
-}
-
-func formatPartitionedVHDFallback(filename, mkfsPath string, layout partitionLayout) (err error) {
-	partitionSize := int64(layout.partitionSectors) * vhdSectorSize
-
-	tempFile, err := os.CreateTemp("", "makevhd-partition-*.img")
-	if err != nil {
-		return fmt.Errorf("create temp filesystem image: %w", err)
-	}
-
-	tempPath := tempFile.Name()
-	defer func() {
-		tempFile.Close()
-		os.Remove(tempPath)
-	}()
-
-	if err := tempFile.Truncate(partitionSize); err != nil {
-		return fmt.Errorf("size temp filesystem image: %w", err)
-	}
-
-	if err := tempFile.Close(); err != nil {
-		return fmt.Errorf("close temp filesystem image: %w", err)
-	}
-
-	args := []string{
-		"--invariant",
-		"-F", fmt.Sprintf("%d", layout.fatBits),
-		"-h", fmt.Sprintf("%d", layout.startLBA),
-		tempPath,
-	}
-
-	output, err := runMkfsCommand(mkfsPath, args)
-	if err != nil {
-		return fmt.Errorf("%w: %s", err, output)
-	}
-
-	source, err := os.Open(tempPath)
-	if err != nil {
-		return fmt.Errorf("open temp filesystem image: %w", err)
-	}
-	defer source.Close()
-
-	metadata, err := readFATMetadataLayoutAt(source, 0, layout.fatBits)
-	if err != nil {
-		return fmt.Errorf("read FAT metadata layout: %w", err)
-	}
-
-	target, err := os.OpenFile(filename, os.O_RDWR, 0)
-	if err != nil {
-		return fmt.Errorf("open target image %q: %w", filename, err)
-	}
-	defer target.Close()
-
-	if err := copyFileRegions(target, source, int64(layout.startLBA)*vhdSectorSize, metadata.regions); err != nil {
-		return fmt.Errorf("copy filesystem metadata into partition: %w", err)
-	}
-
-	return nil
-}
-
-func runMkfsCommand(mkfsPath string, args []string) ([]byte, error) {
-	cmd := exec.Command(mkfsPath, args...)
-	output, err := cmd.CombinedOutput()
-	return output, err
-}
-
-func mkfsOffsetUnsupported(output []byte) bool {
-	text := strings.ToLower(string(output))
-	return strings.Contains(text, "--offset") &&
-		(strings.Contains(text, "unrecognized option") ||
-			strings.Contains(text, "unknown option"))
-}
-
-func readFATMetadataLayoutAt(file *os.File, volumeOffset int64, fatBits int) (fatMetadataLayout, error) {
-	var layout fatMetadataLayout
-	var boot [512]byte
-
-	if _, err := file.ReadAt(boot[:], volumeOffset); err != nil {
-		return layout, err
-	}
-
-	bytesPerSector := binary.LittleEndian.Uint16(boot[11:13])
-	if bytesPerSector == 0 {
-		return layout, errors.New("invalid FAT boot sector: bytes per sector is 0")
-	}
-
-	sectorsPerCluster := boot[13]
-	if sectorsPerCluster == 0 {
-		return layout, errors.New("invalid FAT boot sector: sectors per cluster is 0")
-	}
-
-	reservedSectors := uint32(binary.LittleEndian.Uint16(boot[14:16]))
-	fatCount := uint32(boot[16])
-	if fatCount == 0 {
-		return layout, errors.New("invalid FAT boot sector: FAT count is 0")
-	}
-
-	var sectorsPerFAT uint32
-	switch fatBits {
-	case 12, 16:
-		sectorsPerFAT = uint32(binary.LittleEndian.Uint16(boot[22:24]))
-	case 32:
-		sectorsPerFAT = binary.LittleEndian.Uint32(boot[36:40])
-	default:
-		return layout, fmt.Errorf("unsupported FAT size %d", fatBits)
-	}
-	if sectorsPerFAT == 0 {
-		return layout, errors.New("invalid FAT boot sector: sectors per FAT is 0")
-	}
-
-	layout.bytesPerSector = bytesPerSector
-	layout.sectorsPerCluster = sectorsPerCluster
-
-	regions := []fileRegion{
-		{
-			offset: 0,
-			length: int64(reservedSectors) * int64(bytesPerSector),
-		},
-		{
-			offset: int64(reservedSectors) * int64(bytesPerSector),
-			length: int64(fatCount*sectorsPerFAT) * int64(bytesPerSector),
-		},
-	}
-
-	switch fatBits {
-	case 12, 16:
-		rootEntries := uint32(binary.LittleEndian.Uint16(boot[17:19]))
-		rootDirSectors := (rootEntries*32 + uint32(bytesPerSector) - 1) / uint32(bytesPerSector)
-		rootDirOffset := int64(reservedSectors+fatCount*sectorsPerFAT) * int64(bytesPerSector)
-		regions = append(regions, fileRegion{
-			offset: rootDirOffset,
-			length: int64(rootDirSectors) * int64(bytesPerSector),
-		})
-	case 32:
-		rootCluster := binary.LittleEndian.Uint32(boot[44:48])
-		if rootCluster < 2 {
-			return layout, errors.New("invalid FAT32 boot sector: root cluster is less than 2")
+	for sectorsPerCluster <= 128 {
+		reservedSectors := uint16(fatReservedSectors12_16)
+		rootEntryCount := uint16(fatRootEntryCount)
+		if fatBits == 32 {
+			reservedSectors = fatReservedSectors32
+			rootEntryCount = 0
 		}
 
-		firstDataSector := reservedSectors + fatCount*sectorsPerFAT
-		rootDirSector := firstDataSector + (rootCluster-2)*uint32(sectorsPerCluster)
-		regions = append(regions, fileRegion{
-			offset: int64(rootDirSector) * int64(bytesPerSector),
-			length: int64(sectorsPerCluster) * int64(bytesPerSector),
-		})
-	}
-
-	layout.regions = mergeFileRegions(regions)
-	return layout, nil
-}
-
-func mergeFileRegions(regions []fileRegion) []fileRegion {
-	if len(regions) == 0 {
-		return nil
-	}
-
-	merged := []fileRegion{regions[0]}
-	for _, region := range regions[1:] {
-		last := &merged[len(merged)-1]
-		lastEnd := last.offset + last.length
-		if region.offset <= lastEnd {
-			regionEnd := region.offset + region.length
-			if regionEnd > lastEnd {
-				last.length = regionEnd - last.offset
-			}
-			continue
-		}
-
-		merged = append(merged, region)
-	}
-
-	return merged
-}
-
-func copyFileRegions(dst, src *os.File, dstBaseOffset int64, regions []fileRegion) error {
-	for _, region := range regions {
-		if region.length == 0 {
-			continue
-		}
-
-		if _, err := src.Seek(region.offset, io.SeekStart); err != nil {
-			return err
-		}
-
-		if _, err := dst.Seek(dstBaseOffset+region.offset, io.SeekStart); err != nil {
-			return err
-		}
-
-		written, err := io.CopyN(dst, src, region.length)
+		rootDirSectors := (uint32(rootEntryCount)*32 + vhdSectorSize - 1) / vhdSectorSize
+		sectorsPerFAT, clusterCount, firstDataSector, err := computeFATLayout(totalSectors, reservedSectors, rootDirSectors, sectorsPerCluster, fatBits)
 		if err != nil {
-			return err
+			return format, err
 		}
 
-		if written != region.length {
-			return fmt.Errorf("copied %d bytes for region at offset %d, want %d", written, region.offset, region.length)
+		if validClusterCountForFAT(clusterCount, fatBits) {
+			format = fatFormat{
+				fatBits:           fatBits,
+				totalSectors:      totalSectors,
+				hiddenSectors:     hiddenSectors,
+				volumeOffset:      volumeOffset,
+				sectorsPerCluster: sectorsPerCluster,
+				reservedSectors:   reservedSectors,
+				sectorsPerFAT:     sectorsPerFAT,
+				rootEntryCount:    rootEntryCount,
+				rootDirSectors:    rootDirSectors,
+				firstDataSector:   firstDataSector,
+				clusterCount:      clusterCount,
+				sectorsPerTrack:   sectorsPerTrack,
+				headCount:         headCount,
+				volumeID:          0x1234abcd,
+			}
+			return format, nil
+		}
+
+		if fatBits == 32 {
+			break
+		}
+
+		sectorsPerCluster *= 2
+	}
+
+	return format, fmt.Errorf("unable to derive valid FAT%d layout for %d sectors", fatBits, totalSectors)
+}
+
+// initialSectorsPerCluster picks a starting cluster size for the requested FAT type.
+func initialSectorsPerCluster(fatBits int, totalSectors uint32) uint8 {
+	sizeMB := int((uint64(totalSectors) * vhdSectorSize) / bytesPerMB)
+
+	switch fatBits {
+	case 12:
+		if sizeMB <= 8 {
+			return 4
+		}
+		return 8
+	case 16:
+		switch {
+		case sizeMB <= 128:
+			return 4
+		case sizeMB <= 256:
+			return 8
+		default:
+			return 16
+		}
+	default:
+		return 8
+	}
+}
+
+// defaultBPBGeometry returns conventional BPB geometry values for the volume.
+func defaultBPBGeometry(totalSectors uint32, fatBits int) (uint16, uint16) {
+	switch fatBits {
+	case 12:
+		return 32, 2
+	case 16:
+		if totalSectors < 65536 {
+			return 32, 2
+		}
+		return 32, 8
+	default:
+		return 63, 32
+	}
+}
+
+// computeFATLayout calculates the FAT size, cluster count, and first data sector.
+func computeFATLayout(totalSectors uint32, reservedSectors uint16, rootDirSectors uint32, sectorsPerCluster uint8, fatBits int) (uint32, uint32, uint32, error) {
+	sectorsPerFAT := uint32(1)
+	reserved := uint32(reservedSectors)
+
+	for i := 0; i < 16; i++ {
+		overhead := reserved + fatCount*sectorsPerFAT + rootDirSectors
+		if totalSectors <= overhead {
+			return 0, 0, 0, fmt.Errorf("volume with %d sectors is too small for FAT%d", totalSectors, fatBits)
+		}
+
+		dataSectors := totalSectors - overhead
+		clusterCount := dataSectors / uint32(sectorsPerCluster)
+		if clusterCount == 0 {
+			return 0, 0, 0, fmt.Errorf("volume with %d sectors leaves no data clusters for FAT%d", totalSectors, fatBits)
+		}
+
+		nextSectorsPerFAT := fatSectorsForEntries(clusterCount+2, fatBits)
+		if nextSectorsPerFAT == sectorsPerFAT {
+			return sectorsPerFAT, clusterCount, reserved + fatCount*sectorsPerFAT + rootDirSectors, nil
+		}
+
+		sectorsPerFAT = nextSectorsPerFAT
+	}
+
+	return 0, 0, 0, fmt.Errorf("FAT%d layout did not converge for %d sectors", fatBits, totalSectors)
+}
+
+// fatSectorsForEntries returns the FAT length needed for the given entry count.
+func fatSectorsForEntries(entryCount uint32, fatBits int) uint32 {
+	var fatBytes uint32
+
+	switch fatBits {
+	case 12:
+		fatBytes = (entryCount*3 + 1) / 2
+	case 16:
+		fatBytes = entryCount * 2
+	default:
+		fatBytes = entryCount * 4
+	}
+
+	return (fatBytes + vhdSectorSize - 1) / vhdSectorSize
+}
+
+// validClusterCountForFAT reports whether the cluster count fits the FAT type.
+func validClusterCountForFAT(clusterCount uint32, fatBits int) bool {
+	switch fatBits {
+	case 12:
+		return clusterCount < fatTypeThreshold12
+	case 16:
+		return clusterCount >= fatTypeThreshold12 && clusterCount < fatTypeThreshold16
+	default:
+		return clusterCount >= fatTypeThreshold16
+	}
+}
+
+// writeFATVolume writes the reserved area, FAT tables, and root region for a volume.
+func writeFATVolume(file *os.File, format fatFormat) error {
+	if err := writeReservedRegion(file, format); err != nil {
+		return err
+	}
+
+	if err := writeFATTables(file, format); err != nil {
+		return err
+	}
+
+	if err := writeRootRegion(file, format); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// writeReservedRegion writes the boot and reserved sectors for the filesystem.
+func writeReservedRegion(file *os.File, format fatFormat) error {
+	buf := make([]byte, int(format.reservedSectors)*vhdSectorSize)
+
+	if format.fatBits == 32 {
+		boot := makeFAT32BootSector(format)
+		copy(buf[:vhdSectorSize], boot[:])
+
+		fsInfo := makeFAT32FSInfo(format)
+		copy(buf[int(fat32FSInfoSector)*vhdSectorSize:], fsInfo[:])
+		copy(buf[int(fat32BackupBootSector)*vhdSectorSize:], boot[:])
+		copy(buf[int(fat32BackupBootSector+1)*vhdSectorSize:], fsInfo[:])
+	} else {
+		boot := makeFAT12Or16BootSector(format)
+		copy(buf[:vhdSectorSize], boot[:])
+	}
+
+	if _, err := file.WriteAt(buf, format.volumeOffset); err != nil {
+		return fmt.Errorf("write FAT reserved region: %w", err)
+	}
+
+	return nil
+}
+
+// makeFAT12Or16BootSector builds the boot sector for FAT12 and FAT16 volumes.
+func makeFAT12Or16BootSector(format fatFormat) [vhdSectorSize]byte {
+	var sector [vhdSectorSize]byte
+
+	sector[0] = 0xeb
+	sector[1] = 0x3c
+	sector[2] = 0x90
+	copy(sector[3:11], fatBootOEMName)
+	binary.LittleEndian.PutUint16(sector[11:13], vhdSectorSize)
+	sector[13] = format.sectorsPerCluster
+	binary.LittleEndian.PutUint16(sector[14:16], format.reservedSectors)
+	sector[16] = fatCount
+	binary.LittleEndian.PutUint16(sector[17:19], format.rootEntryCount)
+	putTotalSectorFields(sector[:], format.totalSectors)
+	sector[21] = fatMediaFixedDisk
+	binary.LittleEndian.PutUint16(sector[22:24], uint16(format.sectorsPerFAT))
+	binary.LittleEndian.PutUint16(sector[24:26], format.sectorsPerTrack)
+	binary.LittleEndian.PutUint16(sector[26:28], format.headCount)
+	binary.LittleEndian.PutUint32(sector[28:32], format.hiddenSectors)
+	sector[36] = 0x80
+	sector[38] = fatExtBootSignature
+	binary.LittleEndian.PutUint32(sector[39:43], format.volumeID)
+	copy(sector[43:54], fatVolumeLabel)
+	copy(sector[54:62], fmt.Sprintf("FAT%-5d", format.fatBits))
+	sector[510] = 0x55
+	sector[511] = 0xaa
+	return sector
+}
+
+// makeFAT32BootSector builds the boot sector for a FAT32 volume.
+func makeFAT32BootSector(format fatFormat) [vhdSectorSize]byte {
+	var sector [vhdSectorSize]byte
+
+	sector[0] = 0xeb
+	sector[1] = 0x58
+	sector[2] = 0x90
+	copy(sector[3:11], fatBootOEMName)
+	binary.LittleEndian.PutUint16(sector[11:13], vhdSectorSize)
+	sector[13] = format.sectorsPerCluster
+	binary.LittleEndian.PutUint16(sector[14:16], format.reservedSectors)
+	sector[16] = fatCount
+	sector[21] = fatMediaFixedDisk
+	binary.LittleEndian.PutUint16(sector[24:26], format.sectorsPerTrack)
+	binary.LittleEndian.PutUint16(sector[26:28], format.headCount)
+	binary.LittleEndian.PutUint32(sector[28:32], format.hiddenSectors)
+	binary.LittleEndian.PutUint32(sector[32:36], format.totalSectors)
+	binary.LittleEndian.PutUint32(sector[36:40], format.sectorsPerFAT)
+	binary.LittleEndian.PutUint32(sector[44:48], fatRootCluster)
+	binary.LittleEndian.PutUint16(sector[48:50], fat32FSInfoSector)
+	binary.LittleEndian.PutUint16(sector[50:52], fat32BackupBootSector)
+	sector[64] = 0x80
+	sector[66] = fatExtBootSignature
+	binary.LittleEndian.PutUint32(sector[67:71], format.volumeID)
+	copy(sector[71:82], fatVolumeLabel)
+	copy(sector[82:90], "FAT32   ")
+	sector[510] = 0x55
+	sector[511] = 0xaa
+	return sector
+}
+
+// makeFAT32FSInfo builds the FAT32 FSInfo sector.
+func makeFAT32FSInfo(format fatFormat) [vhdSectorSize]byte {
+	var sector [vhdSectorSize]byte
+
+	binary.LittleEndian.PutUint32(sector[0:4], fatFSInfoLeadSignature)
+	binary.LittleEndian.PutUint32(sector[484:488], fatFSInfoStructSignature)
+	binary.LittleEndian.PutUint32(sector[488:492], format.clusterCount-1)
+	binary.LittleEndian.PutUint32(sector[492:496], fatRootCluster)
+	sector[510] = 0x55
+	sector[511] = 0xaa
+	return sector
+}
+
+// putTotalSectorFields fills the BPB total-sector fields for the volume size.
+func putTotalSectorFields(bootSector []byte, totalSectors uint32) {
+	if totalSectors < 65536 {
+		binary.LittleEndian.PutUint16(bootSector[19:21], uint16(totalSectors))
+		binary.LittleEndian.PutUint32(bootSector[32:36], 0)
+		return
+	}
+
+	binary.LittleEndian.PutUint16(bootSector[19:21], 0)
+	binary.LittleEndian.PutUint32(bootSector[32:36], totalSectors)
+}
+
+// writeFATTables writes both FAT copies for the volume.
+func writeFATTables(file *os.File, format fatFormat) error {
+	fatTable := make([]byte, int(format.sectorsPerFAT)*vhdSectorSize)
+	switch format.fatBits {
+	case 12:
+		setFAT12Entry(fatTable, 0, 0x0ff0|uint16(fatMediaFixedDisk))
+		setFAT12Entry(fatTable, 1, 0x0fff)
+	case 16:
+		binary.LittleEndian.PutUint16(fatTable[0:2], 0xff00|uint16(fatMediaFixedDisk))
+		binary.LittleEndian.PutUint16(fatTable[2:4], 0xffff)
+	default:
+		binary.LittleEndian.PutUint32(fatTable[0:4], fat32EndOfChain&0xffffff00|uint32(fatMediaFixedDisk))
+		binary.LittleEndian.PutUint32(fatTable[4:8], fat32EndOfChain)
+		binary.LittleEndian.PutUint32(fatTable[8:12], fat32EndOfChain)
+	}
+
+	fatOffset := format.volumeOffset + int64(format.reservedSectors)*vhdSectorSize
+	for copyIndex := 0; copyIndex < fatCount; copyIndex++ {
+		offset := fatOffset + int64(copyIndex)*int64(len(fatTable))
+		if _, err := file.WriteAt(fatTable, offset); err != nil {
+			return fmt.Errorf("write FAT table %d: %w", copyIndex+1, err)
 		}
 	}
 
 	return nil
 }
 
-// add the 512 byte VHD footer to the end of the image file
-// the footer contains metadata about the disk image, such as its size and geometry, and is required for the image to be mounted on Windows
+// setFAT12Entry encodes a single 12-bit FAT entry into the table buffer.
+func setFAT12Entry(fatTable []byte, cluster uint16, value uint16) {
+	index := int(cluster) + int(cluster)/2
+	if cluster%2 == 0 {
+		fatTable[index] = byte(value & 0xff)
+		fatTable[index+1] = (fatTable[index+1] & 0xf0) | byte((value>>8)&0x0f)
+		return
+	}
+
+	fatTable[index] = (fatTable[index] & 0x0f) | byte((value<<4)&0xf0)
+	fatTable[index+1] = byte(value >> 4)
+}
+
+// writeRootRegion clears the initial root directory area for an empty volume.
+func writeRootRegion(file *os.File, format fatFormat) error {
+	var offset int64
+	var size int64
+
+	if format.fatBits == 32 {
+		offset = format.volumeOffset + int64(format.firstDataSector)*vhdSectorSize
+		size = int64(format.sectorsPerCluster) * vhdSectorSize
+	} else {
+		rootDirStart := uint32(format.reservedSectors) + fatCount*format.sectorsPerFAT
+		offset = format.volumeOffset + int64(rootDirStart)*vhdSectorSize
+		size = int64(format.rootDirSectors) * vhdSectorSize
+	}
+
+	if size == 0 {
+		return nil
+	}
+
+	if _, err := file.WriteAt(make([]byte, int(size)), offset); err != nil {
+		return fmt.Errorf("write FAT root region: %w", err)
+	}
+
+	return nil
+}
+
+// ConvertToVHD appends a fixed VHD footer to a raw disk image.
 func ConvertToVHD(filename string) error {
 	imageType, err := imageTypeFromFilename(filename)
 	if err != nil {
@@ -472,6 +617,7 @@ func ConvertToVHD(filename string) error {
 	return nil
 }
 
+// validateImageSpec enforces shared filename and size constraints.
 func validateImageSpec(filename string, size int) error {
 	imageType, err := imageTypeFromFilename(filename)
 	if err != nil {
@@ -493,6 +639,7 @@ func validateImageSpec(filename string, size int) error {
 	return nil
 }
 
+// imageTypeFromFilename returns the supported image type for the filename.
 func imageTypeFromFilename(filename string) (string, error) {
 	if filename == "" {
 		return "", errors.New("filename must not be empty")
@@ -508,6 +655,7 @@ func imageTypeFromFilename(filename string) (string, error) {
 	}
 }
 
+// fatBitsForSize chooses FAT12, FAT16, or FAT32 from the image size.
 func fatBitsForSize(size int) int {
 	switch {
 	case size <= maxFAT12SizeMB:
@@ -519,18 +667,7 @@ func fatBitsForSize(size int) int {
 	}
 }
 
-func findMkfsFAT() (string, error) {
-	if path, err := exec.LookPath("mkfs.fat"); err == nil {
-		return path, nil
-	}
-
-	if path, err := exec.LookPath("mkfs.vfat"); err == nil {
-		return path, nil
-	}
-
-	return "", errors.New("mkfs.fat or mkfs.vfat is required to format disk images")
-}
-
+// layoutForVHD calculates the disk and partition layout for a VHD image.
 func layoutForVHD(size int) (partitionLayout, error) {
 	var layout partitionLayout
 
@@ -557,6 +694,7 @@ func layoutForVHD(size int) (partitionLayout, error) {
 	return layout, nil
 }
 
+// partitionTypeForFAT returns the MBR partition type for the FAT variant.
 func partitionTypeForFAT(fatBits int) byte {
 	switch fatBits {
 	case 12:
@@ -568,6 +706,7 @@ func partitionTypeForFAT(fatBits int) byte {
 	}
 }
 
+// writeMBR writes a single-partition MBR for a VHD image.
 func writeMBR(filename string, size int) error {
 	layout, err := layoutForVHD(size)
 	if err != nil {
@@ -627,6 +766,7 @@ func writeMBR(filename string, size int) error {
 	return nil
 }
 
+// buildFixedVHDFooter builds a fixed-disk VHD footer for the raw image size.
 func buildFixedVHDFooter(rawSize int64, now time.Time) ([vhdFooterSize]byte, error) {
 	var footer [vhdFooterSize]byte
 
@@ -664,6 +804,7 @@ func buildFixedVHDFooter(rawSize int64, now time.Time) ([vhdFooterSize]byte, err
 	return footer, nil
 }
 
+// lbaToCHS converts an LBA address into packed CHS fields.
 func lbaToCHS(lba uint32, heads uint8, sectorsPerTrack uint8) (byte, byte, byte) {
 	if heads == 0 || sectorsPerTrack == 0 {
 		return 0, 0, 0
@@ -684,6 +825,7 @@ func lbaToCHS(lba uint32, heads uint8, sectorsPerTrack uint8) (byte, byte, byte)
 	return byte(head), sectorByte, cylinderByte
 }
 
+// hasValidVHDFooter reports whether the file already ends with a valid footer.
 func hasValidVHDFooter(file *os.File, size int64) (bool, error) {
 	if size < vhdFooterSize {
 		return false, nil
@@ -697,6 +839,7 @@ func hasValidVHDFooter(file *os.File, size int64) (bool, error) {
 	return isValidVHDFooter(footer[:]), nil
 }
 
+// isValidVHDFooter validates the fixed fields and checksum of a VHD footer.
 func isValidVHDFooter(footer []byte) bool {
 	if len(footer) != vhdFooterSize {
 		return false
@@ -724,6 +867,7 @@ func isValidVHDFooter(footer []byte) bool {
 	return vhdChecksum(buf) == wantChecksum
 }
 
+// vhdGeometry chooses a CHS geometry that can represent the disk size.
 func vhdGeometry(totalSectors int64) (uint16, uint8, uint8) {
 	candidateSectors := totalSectors
 	if candidateSectors > vhdMaxGeometrySectors {
@@ -740,6 +884,7 @@ func vhdGeometry(totalSectors int64) (uint16, uint8, uint8) {
 	}
 }
 
+// chsGeometry derives a legacy CHS geometry from a sector count.
 func chsGeometry(totalSectors int64) (uint16, uint8, uint8) {
 	if totalSectors > vhdMaxGeometrySectors {
 		totalSectors = vhdMaxGeometrySectors
@@ -779,6 +924,7 @@ func chsGeometry(totalSectors int64) (uint16, uint8, uint8) {
 	return cylinders, heads, sectorsPerTrack
 }
 
+// vhdChecksum computes the checksum used in a VHD footer.
 func vhdChecksum(footer []byte) uint32 {
 	var sum uint32
 	for _, b := range footer {
@@ -788,6 +934,7 @@ func vhdChecksum(footer []byte) uint32 {
 	return ^sum
 }
 
+// vhdTimestamp converts a time into the VHD epoch.
 func vhdTimestamp(now time.Time) uint32 {
 	timestamp := now.Unix() - vhdTimestampBaseUnix
 	if timestamp < 0 {

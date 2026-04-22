@@ -77,8 +77,6 @@ func TestCreateImageRejectsSizeAboveMaximum(t *testing.T) {
 }
 
 func TestFormatImageWritesFAT12BootSector(t *testing.T) {
-	requireMkfsFAT(t)
-
 	imagePath := filepath.Join(t.TempDir(), "fat12.vhd")
 	if err := CreateImage(imagePath, 8); err != nil {
 		t.Fatalf("CreateImage returned error: %v", err)
@@ -103,8 +101,6 @@ func TestFormatImageWritesFAT12BootSector(t *testing.T) {
 }
 
 func TestFormatImageWritesFAT16BootSector(t *testing.T) {
-	requireMkfsFAT(t)
-
 	imagePath := filepath.Join(t.TempDir(), "fat16.vhd")
 	if err := CreateImage(imagePath, 64); err != nil {
 		t.Fatalf("CreateImage returned error: %v", err)
@@ -129,8 +125,6 @@ func TestFormatImageWritesFAT16BootSector(t *testing.T) {
 }
 
 func TestFormatImageWritesFAT32BootSector(t *testing.T) {
-	requireMkfsFAT(t)
-
 	imagePath := filepath.Join(t.TempDir(), "fat32.vhd")
 	if err := CreateImage(imagePath, 514); err != nil {
 		t.Fatalf("CreateImage returned error: %v", err)
@@ -154,114 +148,79 @@ func TestFormatImageWritesFAT32BootSector(t *testing.T) {
 	assertHiddenSectors(t, imagePath, int64(layout.startLBA), layout.startLBA)
 }
 
-func TestFormatImageFallsBackWhenMkfsOffsetUnsupported(t *testing.T) {
-	requireMkfsFAT(t)
-
-	imagePath := filepath.Join(t.TempDir(), "fallback.vhd")
+func TestFormatImageInitializesFAT12Entries(t *testing.T) {
+	imagePath := filepath.Join(t.TempDir(), "fat12.img")
 	if err := CreateImage(imagePath, 8); err != nil {
 		t.Fatalf("CreateImage returned error: %v", err)
 	}
 
-	if err := writeMBR(imagePath, 8); err != nil {
-		t.Fatalf("writeMBR returned error: %v", err)
+	if err := FormatImage(imagePath, 8); err != nil {
+		t.Fatalf("FormatImage returned error: %v", err)
 	}
 
-	layout, err := layoutForVHD(8)
-	if err != nil {
-		t.Fatalf("layoutForVHD returned error: %v", err)
-	}
-
-	mkfsPath, err := findMkfsFAT()
-	if err != nil {
-		t.Fatalf("findMkfsFAT returned error: %v", err)
-	}
-
-	fakeMkfsPath := filepath.Join(t.TempDir(), "mkfs-fat-fallback.sh")
-	script := "#!/usr/bin/env bash\n" +
-		"for arg in \"$@\"; do\n" +
-		"    if [[ \"$arg\" == \"--offset\" || \"$arg\" == --offset=* ]]; then\n" +
-		"        echo \"/usr/sbin/mkfs.fat: unrecognized option '--offset'\" >&2\n" +
-		"        echo \"Unknown option: ?\" >&2\n" +
-		"        exit 1\n" +
-		"    fi\n" +
-		"done\n" +
-		"exec \"" + mkfsPath + "\" \"$@\"\n"
-	if err := os.WriteFile(fakeMkfsPath, []byte(script), 0o755); err != nil {
-		t.Fatalf("WriteFile returned error: %v", err)
-	}
-
-	if err := formatPartitionedVHD(imagePath, fakeMkfsPath, layout); err != nil {
-		t.Fatalf("formatPartitionedVHD returned error: %v", err)
-	}
-
-	assertFilesystemTypeAtLBA(t, imagePath, int64(layout.startLBA), 54, "FAT12   ")
-	assertBootSignatureAtLBA(t, imagePath, int64(layout.startLBA))
-	assertHiddenSectors(t, imagePath, int64(layout.startLBA), layout.startLBA)
+	assertBytesAt(t, imagePath, int64(fatReservedSectors12_16)*vhdSectorSize, []byte{0xf8, 0xff, 0xff})
 }
 
-func TestFormatImageFallbackCopiesOnlyMetadata(t *testing.T) {
-	requireMkfsFAT(t)
-
-	imagePath := filepath.Join(t.TempDir(), "metadata-only.vhd")
-	if err := CreateImage(imagePath, 8); err != nil {
+func TestFormatImageInitializesFAT16Entries(t *testing.T) {
+	imagePath := filepath.Join(t.TempDir(), "fat16.vhd")
+	if err := CreateImage(imagePath, 64); err != nil {
 		t.Fatalf("CreateImage returned error: %v", err)
 	}
 
-	if err := writeMBR(imagePath, 8); err != nil {
+	if err := writeMBR(imagePath, 64); err != nil {
 		t.Fatalf("writeMBR returned error: %v", err)
 	}
 
-	layout, err := layoutForVHD(8)
+	if err := FormatImage(imagePath, 64); err != nil {
+		t.Fatalf("FormatImage returned error: %v", err)
+	}
+
+	layout, err := layoutForVHD(64)
 	if err != nil {
 		t.Fatalf("layoutForVHD returned error: %v", err)
 	}
 
-	const markerOffset = int64(2 * bytesPerMB)
-	marker := bytesRepeated(0xaa, 64)
-	file, err := os.OpenFile(imagePath, os.O_RDWR, 0)
+	assertBytesAt(t, imagePath, int64(layout.startLBA+fatReservedSectors12_16)*vhdSectorSize, []byte{0xf8, 0xff, 0xff, 0xff})
+}
+
+func TestFormatImageInitializesFAT32Metadata(t *testing.T) {
+	imagePath := filepath.Join(t.TempDir(), "fat32.vhd")
+	if err := CreateImage(imagePath, 514); err != nil {
+		t.Fatalf("CreateImage returned error: %v", err)
+	}
+
+	if err := writeMBR(imagePath, 514); err != nil {
+		t.Fatalf("writeMBR returned error: %v", err)
+	}
+
+	if err := FormatImage(imagePath, 514); err != nil {
+		t.Fatalf("FormatImage returned error: %v", err)
+	}
+
+	layout, err := layoutForVHD(514)
 	if err != nil {
-		t.Fatalf("OpenFile returned error: %v", err)
-	}
-	if _, err := file.WriteAt(marker, int64(layout.startLBA)*vhdSectorSize+markerOffset); err != nil {
-		file.Close()
-		t.Fatalf("WriteAt returned error: %v", err)
-	}
-	if err := file.Close(); err != nil {
-		t.Fatalf("Close returned error: %v", err)
+		t.Fatalf("layoutForVHD returned error: %v", err)
 	}
 
-	mkfsPath, err := findMkfsFAT()
-	if err != nil {
-		t.Fatalf("findMkfsFAT returned error: %v", err)
+	fsInfo := readBytesAt(t, imagePath, int64(layout.startLBA+fat32FSInfoSector)*vhdSectorSize, vhdSectorSize)
+	if binary.LittleEndian.Uint32(fsInfo[0:4]) != fatFSInfoLeadSignature {
+		t.Fatalf("FSInfo lead signature = %#x, want %#x", binary.LittleEndian.Uint32(fsInfo[0:4]), fatFSInfoLeadSignature)
+	}
+	if binary.LittleEndian.Uint32(fsInfo[484:488]) != fatFSInfoStructSignature {
+		t.Fatalf("FSInfo struct signature = %#x, want %#x", binary.LittleEndian.Uint32(fsInfo[484:488]), fatFSInfoStructSignature)
+	}
+	if binary.LittleEndian.Uint32(fsInfo[492:496]) != fatRootCluster {
+		t.Fatalf("FSInfo next free cluster hint = %d, want %d", binary.LittleEndian.Uint32(fsInfo[492:496]), fatRootCluster)
 	}
 
-	fakeMkfsPath := filepath.Join(t.TempDir(), "mkfs-fat-fallback-metadata.sh")
-	script := "#!/usr/bin/env bash\n" +
-		"for arg in \"$@\"; do\n" +
-		"    if [[ \"$arg\" == \"--offset\" || \"$arg\" == --offset=* ]]; then\n" +
-		"        echo \"/usr/sbin/mkfs.fat: unrecognized option '--offset'\" >&2\n" +
-		"        echo \"Unknown option: ?\" >&2\n" +
-		"        exit 1\n" +
-		"    fi\n" +
-		"done\n" +
-		"exec \"" + mkfsPath + "\" \"$@\"\n"
-	if err := os.WriteFile(fakeMkfsPath, []byte(script), 0o755); err != nil {
-		t.Fatalf("WriteFile returned error: %v", err)
-	}
-
-	if err := formatPartitionedVHD(imagePath, fakeMkfsPath, layout); err != nil {
-		t.Fatalf("formatPartitionedVHD returned error: %v", err)
-	}
-
-	got := readBytesAt(t, imagePath, int64(layout.startLBA)*vhdSectorSize+markerOffset, len(marker))
-	if string(got) != string(marker) {
-		t.Fatal("fallback overwrote data area beyond filesystem metadata")
-	}
+	assertBytesAt(t, imagePath, int64(layout.startLBA+fatReservedSectors32)*vhdSectorSize, []byte{
+		0xf8, 0xff, 0xff, 0x0f,
+		0xff, 0xff, 0xff, 0x0f,
+		0xff, 0xff, 0xff, 0x0f,
+	})
 }
 
 func TestFormatImageWritesSuperFloppyBootSector(t *testing.T) {
-	requireMkfsFAT(t)
-
 	imagePath := filepath.Join(t.TempDir(), "disk.img")
 	if err := CreateImage(imagePath, 8); err != nil {
 		t.Fatalf("CreateImage returned error: %v", err)
@@ -277,8 +236,6 @@ func TestFormatImageWritesSuperFloppyBootSector(t *testing.T) {
 }
 
 func TestFormatImageRejectsUnexpectedFileSize(t *testing.T) {
-	requireMkfsFAT(t)
-
 	imagePath := filepath.Join(t.TempDir(), "mismatch.vhd")
 	if err := os.WriteFile(imagePath, make([]byte, 1024), 0o644); err != nil {
 		t.Fatalf("WriteFile returned error: %v", err)
@@ -366,8 +323,6 @@ func TestConvertToVHDRejectsIMGExtension(t *testing.T) {
 }
 
 func TestMakeVHDCreatesFormattedIMG(t *testing.T) {
-	requireMkfsFAT(t)
-
 	imagePath := filepath.Join(t.TempDir(), "disk.img")
 	if err := MakeVHD(imagePath, 8); err != nil {
 		t.Fatalf("MakeVHD returned error: %v", err)
@@ -389,8 +344,6 @@ func TestMakeVHDCreatesFormattedIMG(t *testing.T) {
 }
 
 func TestMakeVHDCreatesVHDWithFooter(t *testing.T) {
-	requireMkfsFAT(t)
-
 	imagePath := filepath.Join(t.TempDir(), "disk.vhd")
 	if err := MakeVHD(imagePath, 8); err != nil {
 		t.Fatalf("MakeVHD returned error: %v", err)
@@ -453,70 +406,6 @@ func TestBuildFixedVHDFooterUsesStableFields(t *testing.T) {
 	}
 }
 
-func TestMkfsOffsetUnsupported(t *testing.T) {
-	output := []byte("/usr/sbin/mkfs.fat: unrecognized option '--offset'\nUnknown option: ?\n")
-	if !mkfsOffsetUnsupported(output) {
-		t.Fatal("mkfsOffsetUnsupported returned false for unsupported --offset output")
-	}
-
-	if mkfsOffsetUnsupported([]byte("some other mkfs error")) {
-		t.Fatal("mkfsOffsetUnsupported returned true for unrelated error output")
-	}
-}
-
-func TestReadFATMetadataLayoutAt(t *testing.T) {
-	requireMkfsFAT(t)
-
-	imagePath := filepath.Join(t.TempDir(), "layout.vhd")
-	if err := CreateImage(imagePath, 8); err != nil {
-		t.Fatalf("CreateImage returned error: %v", err)
-	}
-
-	if err := writeMBR(imagePath, 8); err != nil {
-		t.Fatalf("writeMBR returned error: %v", err)
-	}
-
-	if err := FormatImage(imagePath, 8); err != nil {
-		t.Fatalf("FormatImage returned error: %v", err)
-	}
-
-	layout, err := layoutForVHD(8)
-	if err != nil {
-		t.Fatalf("layoutForVHD returned error: %v", err)
-	}
-
-	file, err := os.Open(imagePath)
-	if err != nil {
-		t.Fatalf("Open returned error: %v", err)
-	}
-	defer file.Close()
-
-	metadata, err := readFATMetadataLayoutAt(file, int64(layout.startLBA)*vhdSectorSize, layout.fatBits)
-	if err != nil {
-		t.Fatalf("readFATMetadataLayoutAt returned error: %v", err)
-	}
-
-	if metadata.bytesPerSector != 512 {
-		t.Fatalf("bytes per sector = %d, want 512", metadata.bytesPerSector)
-	}
-
-	if len(metadata.regions) != 1 {
-		t.Fatalf("metadata region count = %d, want 1", len(metadata.regions))
-	}
-
-	if metadata.regions[0].offset != 0 {
-		t.Fatalf("metadata region offset = %d, want 0", metadata.regions[0].offset)
-	}
-}
-
-func requireMkfsFAT(t *testing.T) {
-	t.Helper()
-
-	if _, err := findMkfsFAT(); err != nil {
-		t.Skipf("skipping test: %v", err)
-	}
-}
-
 func assertFilesystemTypeAtLBA(t *testing.T, imagePath string, lba int64, offset int64, want string) {
 	t.Helper()
 
@@ -571,6 +460,17 @@ func assertMBRPartition(t *testing.T, imagePath string, layout partitionLayout) 
 	}
 }
 
+func assertBytesAt(t *testing.T, imagePath string, offset int64, want []byte) {
+	t.Helper()
+
+	got := readBytesAt(t, imagePath, offset, len(want))
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("byte at offset %d = %#x, want %#x", offset+int64(i), got[i], want[i])
+		}
+	}
+}
+
 func readBytesAt(t *testing.T, imagePath string, offset int64, size int) []byte {
 	t.Helper()
 
@@ -585,14 +485,6 @@ func readBytesAt(t *testing.T, imagePath string, offset int64, size int) []byte 
 		t.Fatalf("ReadAt returned error: %v", err)
 	}
 
-	return buf
-}
-
-func bytesRepeated(value byte, count int) []byte {
-	buf := make([]byte, count)
-	for i := range buf {
-		buf[i] = value
-	}
 	return buf
 }
 

@@ -19,13 +19,6 @@ The code is split into:
 ## Requirements
 
 - Go 1.22+
-- `mkfs.fat` or `mkfs.vfat` available on the system path
-
-On Debian/Ubuntu, `mkfs.fat` is usually provided by:
-
-```bash
-sudo apt install dosfstools
-```
 
 ## Usage
 
@@ -151,6 +144,7 @@ go test ./...
 ## Notes
 
 - FAT type is selected automatically from the image size.
+- FAT formatting is implemented in Go; no external formatter is required.
 - `.img` and `.vhd` are intentionally different formats.
 - `.vhd` is a disk image with a partition table.
 - `.img` is a filesystem image without a partition table.
