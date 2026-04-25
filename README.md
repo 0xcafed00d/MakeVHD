@@ -29,11 +29,22 @@ go run . mydisk.img 64
 go run . mydisk.vhd 64
 ```
 
+To request a standard DOS floppy image, use an `.img` filename with `--floppy`:
+
+```bash
+go run . floppy.img --floppy 1440k
+go run . floppy.img --floppy 1.44m
+go run . floppy.img --floppy 3.5hd
+```
+
+The floppy command-line form is accepted by the CLI, but the floppy image creation backend is currently a stub and returns `floppy image creation is not implemented`.
+
 Or build the binary first:
 
 ```bash
 go build .
 ./makevhd mydisk.vhd 64
+./makevhd floppy.img --floppy 1440k
 ```
 
 Rules:
@@ -41,6 +52,21 @@ Rules:
 - filename must end in `.img` or `.vhd`
 - maximum size is `2048 MB`
 - `.vhd` files must be at least `3 MB`
+- floppy images must use `.img`
+- floppy presets are selected with `--floppy <preset>` or `--floppy=<preset>`
+
+Supported floppy presets:
+
+| Preset | Common aliases |
+| --- | --- |
+| `160k` | `160kb` |
+| `180k` | `180kb` |
+| `320k` | `320kb` |
+| `360k` | `360kb`, `5.25dd`, `5.25-dd` |
+| `720k` | `720kb`, `3.5dd`, `3.5-dd` |
+| `1200k` | `1200kb`, `1.2m`, `1.2mb`, `5.25hd`, `5.25-hd` |
+| `1440k` | `1440kb`, `1.44m`, `1.44mb`, `3.5hd`, `3.5-hd` |
+| `2880k` | `2880kb`, `2.88m`, `2.88mb`, `3.5ed`, `3.5-ed` |
 
 ## Output Behavior
 
@@ -51,6 +77,15 @@ Creates a raw superfloppy image:
 - no partition table
 - FAT filesystem starts at sector 0
 - useful for direct loop mounting on Linux
+
+### DOS floppy `.img`
+
+Creates a raw FAT12 floppy image using one of the standard DOS floppy layouts.
+
+- no partition table
+- output filename must end in `.img`
+- size and disk geometry come from the named floppy preset
+- common size and media aliases are normalized to the canonical preset
 
 ### `.vhd`
 
