@@ -87,6 +87,7 @@ case "${image_path##*.}" in
 
         if [[ ! -b "$partdev" ]]; then
             echo "partition device not found for $loopdev" >&2
+            cleanup_on_error
             exit 1
         fi
 

@@ -87,7 +87,7 @@ type fatFormat struct {
 }
 
 // MakeVHD creates either a FAT-formatted superfloppy IMG or a fixed VHD.
-func MakeVHD(filename string, size int) error {
+func MakeVHD(filename string, size int) (err error) {
 	imageType, err := imageTypeFromFilename(filename)
 	if err != nil {
 		return err
@@ -96,6 +96,7 @@ func MakeVHD(filename string, size int) error {
 	if err := CreateImage(filename, size); err != nil {
 		return fmt.Errorf("CreateImage: %w", err)
 	}
+	defer cleanupPartialImageOnError(filename, &err)
 
 	if imageType == imageExtIMG {
 		if err := FormatImage(filename, size); err != nil {
@@ -117,6 +118,16 @@ func MakeVHD(filename string, size int) error {
 	}
 
 	return nil
+}
+
+func cleanupPartialImageOnError(filename string, err *error) {
+	if *err == nil {
+		return
+	}
+
+	if removeErr := os.Remove(filename); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+		*err = fmt.Errorf("%w; additionally failed to remove partial image %q: %v", *err, filename, removeErr)
+	}
 }
 
 // CreateImage creates a blank image file at the requested size.

@@ -2,6 +2,7 @@ package disktools
 
 import (
 	"encoding/binary"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -380,6 +381,38 @@ func TestMakeVHDRejectsUnsupportedExtension(t *testing.T) {
 
 	if err := MakeVHD(imagePath, 8); err == nil {
 		t.Fatal("MakeVHD returned nil error for unsupported filename extension")
+	}
+}
+
+func TestCleanupPartialImageOnErrorRemovesFile(t *testing.T) {
+	imagePath := filepath.Join(t.TempDir(), "partial.img")
+	if err := os.WriteFile(imagePath, []byte("partial"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+
+	err := errors.New("format failed")
+	cleanupPartialImageOnError(imagePath, &err)
+
+	if err == nil {
+		t.Fatal("cleanupPartialImageOnError cleared the original error")
+	}
+
+	if _, statErr := os.Stat(imagePath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("partial image still exists after cleanup, stat error: %v", statErr)
+	}
+}
+
+func TestCleanupPartialImageOnErrorKeepsFileWithoutError(t *testing.T) {
+	imagePath := filepath.Join(t.TempDir(), "finished.img")
+	if err := os.WriteFile(imagePath, []byte("finished"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+
+	var err error
+	cleanupPartialImageOnError(imagePath, &err)
+
+	if _, statErr := os.Stat(imagePath); statErr != nil {
+		t.Fatalf("finished image was removed, stat error: %v", statErr)
 	}
 }
 
