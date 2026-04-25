@@ -130,6 +130,11 @@ func cleanupPartialImageOnError(filename string, err *error) {
 	}
 }
 
+// MakeFloppyImage creates a DOS floppy image for a standard floppy preset.
+func MakeFloppyImage(filename string, preset string) error {
+	return errors.New("floppy image creation is not implemented")
+}
+
 // CreateImage creates a blank image file at the requested size.
 func CreateImage(filename string, size int) (err error) {
 	if err := validateImageSpec(filename, size); err != nil {
