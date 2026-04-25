@@ -37,8 +37,6 @@ go run . floppy.img --floppy 1.44m
 go run . floppy.img --floppy 3.5hd
 ```
 
-The floppy command-line form is accepted by the CLI, but the floppy image creation backend is currently a stub and returns `floppy image creation is not implemented`.
-
 Or build the binary first:
 
 ```bash

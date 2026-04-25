@@ -36,6 +36,8 @@ const fatRootCluster = 2
 const fat32FSInfoSector = 1
 const fat32BackupBootSector = 6
 const fatMediaFixedDisk = 0xf8
+const fatDriveNumberFloppy = 0x00
+const fatDriveNumberFixedDisk = 0x80
 const fatExtBootSignature = 0x29
 const fatTypeThreshold12 = 4085
 const fatTypeThreshold16 = 65525
@@ -83,7 +85,103 @@ type fatFormat struct {
 	clusterCount      uint32
 	sectorsPerTrack   uint16
 	headCount         uint16
+	mediaDescriptor   byte
+	driveNumber       byte
 	volumeID          uint32
+}
+
+type floppyLayout struct {
+	totalSectors      uint32
+	sectorsPerTrack   uint16
+	headCount         uint16
+	sectorsPerCluster uint8
+	reservedSectors   uint16
+	rootEntryCount    uint16
+	sectorsPerFAT     uint32
+	mediaDescriptor   byte
+}
+
+var floppyLayouts = map[string]floppyLayout{
+	"160k": {
+		totalSectors:      320,
+		sectorsPerTrack:   8,
+		headCount:         1,
+		sectorsPerCluster: 1,
+		reservedSectors:   1,
+		rootEntryCount:    64,
+		sectorsPerFAT:     1,
+		mediaDescriptor:   0xfe,
+	},
+	"180k": {
+		totalSectors:      360,
+		sectorsPerTrack:   9,
+		headCount:         1,
+		sectorsPerCluster: 1,
+		reservedSectors:   1,
+		rootEntryCount:    64,
+		sectorsPerFAT:     2,
+		mediaDescriptor:   0xfc,
+	},
+	"320k": {
+		totalSectors:      640,
+		sectorsPerTrack:   8,
+		headCount:         2,
+		sectorsPerCluster: 2,
+		reservedSectors:   1,
+		rootEntryCount:    112,
+		sectorsPerFAT:     1,
+		mediaDescriptor:   0xff,
+	},
+	"360k": {
+		totalSectors:      720,
+		sectorsPerTrack:   9,
+		headCount:         2,
+		sectorsPerCluster: 2,
+		reservedSectors:   1,
+		rootEntryCount:    112,
+		sectorsPerFAT:     2,
+		mediaDescriptor:   0xfd,
+	},
+	"720k": {
+		totalSectors:      1440,
+		sectorsPerTrack:   9,
+		headCount:         2,
+		sectorsPerCluster: 2,
+		reservedSectors:   1,
+		rootEntryCount:    112,
+		sectorsPerFAT:     3,
+		mediaDescriptor:   0xf9,
+	},
+	"1200k": {
+		totalSectors:      2400,
+		sectorsPerTrack:   15,
+		headCount:         2,
+		sectorsPerCluster: 1,
+		reservedSectors:   1,
+		rootEntryCount:    224,
+		sectorsPerFAT:     7,
+		mediaDescriptor:   0xf9,
+	},
+	"1440k": {
+		totalSectors:      2880,
+		sectorsPerTrack:   18,
+		headCount:         2,
+		sectorsPerCluster: 1,
+		reservedSectors:   1,
+		rootEntryCount:    224,
+		sectorsPerFAT:     9,
+		mediaDescriptor:   0xf0,
+	},
+	"2880k": {
+		totalSectors:      5760,
+		sectorsPerTrack:   36,
+		headCount:         2,
+		sectorsPerCluster: 2,
+		reservedSectors:   1,
+		rootEntryCount:    240,
+		sectorsPerFAT:     9,
+		mediaDescriptor:   0xf0,
+	},
 }
 
 // MakeVHD creates either a FAT-formatted superfloppy IMG or a fixed VHD.
@@ -131,8 +229,46 @@ func cleanupPartialImageOnError(filename string, err *error) {
 }
 
 // MakeFloppyImage creates a DOS floppy image for a standard floppy preset.
-func MakeFloppyImage(filename string, preset string) error {
-	return errors.New("floppy image creation is not implemented")
+func MakeFloppyImage(filename string, preset string) (err error) {
+	imageType, err := imageTypeFromFilename(filename)
+	if err != nil {
+		return err
+	}
+	if imageType != imageExtIMG {
+		return fmt.Errorf("floppy images must use %q extension", imageExtIMG)
+	}
+
+	layout, ok := floppyLayouts[strings.ToLower(preset)]
+	if !ok {
+		return fmt.Errorf("unsupported floppy preset %q", preset)
+	}
+
+	format, err := makeFloppyFATFormat(layout)
+	if err != nil {
+		return err
+	}
+
+	file, err := os.OpenFile(filename, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o644)
+	if err != nil {
+		return fmt.Errorf("create floppy image file %q: %w", filename, err)
+	}
+	defer cleanupPartialImageOnError(filename, &err)
+	defer func() {
+		if closeErr := file.Close(); err == nil && closeErr != nil {
+			err = fmt.Errorf("close floppy image file %q: %w", filename, closeErr)
+		}
+	}()
+
+	imageSize := int64(layout.totalSectors) * vhdSectorSize
+	if err := file.Truncate(imageSize); err != nil {
+		return fmt.Errorf("set floppy image size to %d bytes: %w", imageSize, err)
+	}
+
+	if err := writeFATVolume(file, format); err != nil {
+		return fmt.Errorf("format floppy image %q: %w", filename, err)
+	}
+
+	return nil
 }
 
 // CreateImage creates a blank image file at the requested size.
@@ -274,6 +410,8 @@ func makeFATFormat(volumeSizeBytes int64, fatBits int, hiddenSectors uint32, vol
 				clusterCount:      clusterCount,
 				sectorsPerTrack:   sectorsPerTrack,
 				headCount:         headCount,
+				mediaDescriptor:   fatMediaFixedDisk,
+				driveNumber:       fatDriveNumberFixedDisk,
 				volumeID:          0x1234abcd,
 			}
 			return format, nil
@@ -287,6 +425,47 @@ func makeFATFormat(volumeSizeBytes int64, fatBits int, hiddenSectors uint32, vol
 	}
 
 	return format, fmt.Errorf("unable to derive valid FAT%d layout for %d sectors", fatBits, totalSectors)
+}
+
+// makeFloppyFATFormat builds the fixed FAT12 layout for a DOS floppy preset.
+func makeFloppyFATFormat(layout floppyLayout) (fatFormat, error) {
+	var format fatFormat
+
+	rootDirSectors := (uint32(layout.rootEntryCount)*32 + vhdSectorSize - 1) / vhdSectorSize
+	firstDataSector := uint32(layout.reservedSectors) + fatCount*layout.sectorsPerFAT + rootDirSectors
+	if layout.totalSectors <= firstDataSector {
+		return format, fmt.Errorf("floppy layout with %d sectors leaves no data area", layout.totalSectors)
+	}
+
+	dataSectors := layout.totalSectors - firstDataSector
+	clusterCount := dataSectors / uint32(layout.sectorsPerCluster)
+	if !validClusterCountForFAT(clusterCount, 12) {
+		return format, fmt.Errorf("floppy layout has invalid FAT12 cluster count %d", clusterCount)
+	}
+
+	requiredSectorsPerFAT := fatSectorsForEntries(clusterCount+2, 12)
+	if requiredSectorsPerFAT > layout.sectorsPerFAT {
+		return format, fmt.Errorf("floppy layout needs %d FAT sectors, has %d", requiredSectorsPerFAT, layout.sectorsPerFAT)
+	}
+
+	return fatFormat{
+		fatBits:           12,
+		totalSectors:      layout.totalSectors,
+		hiddenSectors:     0,
+		volumeOffset:      0,
+		sectorsPerCluster: layout.sectorsPerCluster,
+		reservedSectors:   layout.reservedSectors,
+		sectorsPerFAT:     layout.sectorsPerFAT,
+		rootEntryCount:    layout.rootEntryCount,
+		rootDirSectors:    rootDirSectors,
+		firstDataSector:   firstDataSector,
+		clusterCount:      clusterCount,
+		sectorsPerTrack:   layout.sectorsPerTrack,
+		headCount:         layout.headCount,
+		mediaDescriptor:   layout.mediaDescriptor,
+		driveNumber:       fatDriveNumberFloppy,
+		volumeID:          0x1234abcd,
+	}, nil
 }
 
 // initialSectorsPerCluster picks a starting cluster size for the requested FAT type.
@@ -439,12 +618,12 @@ func makeFAT12Or16BootSector(format fatFormat) [vhdSectorSize]byte {
 	sector[16] = fatCount
 	binary.LittleEndian.PutUint16(sector[17:19], format.rootEntryCount)
 	putTotalSectorFields(sector[:], format.totalSectors)
-	sector[21] = fatMediaFixedDisk
+	sector[21] = format.mediaDescriptor
 	binary.LittleEndian.PutUint16(sector[22:24], uint16(format.sectorsPerFAT))
 	binary.LittleEndian.PutUint16(sector[24:26], format.sectorsPerTrack)
 	binary.LittleEndian.PutUint16(sector[26:28], format.headCount)
 	binary.LittleEndian.PutUint32(sector[28:32], format.hiddenSectors)
-	sector[36] = 0x80
+	sector[36] = format.driveNumber
 	sector[38] = fatExtBootSignature
 	binary.LittleEndian.PutUint32(sector[39:43], format.volumeID)
 	copy(sector[43:54], fatVolumeLabel)
@@ -466,7 +645,7 @@ func makeFAT32BootSector(format fatFormat) [vhdSectorSize]byte {
 	sector[13] = format.sectorsPerCluster
 	binary.LittleEndian.PutUint16(sector[14:16], format.reservedSectors)
 	sector[16] = fatCount
-	sector[21] = fatMediaFixedDisk
+	sector[21] = format.mediaDescriptor
 	binary.LittleEndian.PutUint16(sector[24:26], format.sectorsPerTrack)
 	binary.LittleEndian.PutUint16(sector[26:28], format.headCount)
 	binary.LittleEndian.PutUint32(sector[28:32], format.hiddenSectors)
@@ -475,7 +654,7 @@ func makeFAT32BootSector(format fatFormat) [vhdSectorSize]byte {
 	binary.LittleEndian.PutUint32(sector[44:48], fatRootCluster)
 	binary.LittleEndian.PutUint16(sector[48:50], fat32FSInfoSector)
 	binary.LittleEndian.PutUint16(sector[50:52], fat32BackupBootSector)
-	sector[64] = 0x80
+	sector[64] = format.driveNumber
 	sector[66] = fatExtBootSignature
 	binary.LittleEndian.PutUint32(sector[67:71], format.volumeID)
 	copy(sector[71:82], fatVolumeLabel)
@@ -515,13 +694,13 @@ func writeFATTables(file *os.File, format fatFormat) error {
 	fatTable := make([]byte, int(format.sectorsPerFAT)*vhdSectorSize)
 	switch format.fatBits {
 	case 12:
-		setFAT12Entry(fatTable, 0, 0x0ff0|uint16(fatMediaFixedDisk))
+		setFAT12Entry(fatTable, 0, 0x0ff0|uint16(format.mediaDescriptor))
 		setFAT12Entry(fatTable, 1, 0x0fff)
 	case 16:
-		binary.LittleEndian.PutUint16(fatTable[0:2], 0xff00|uint16(fatMediaFixedDisk))
+		binary.LittleEndian.PutUint16(fatTable[0:2], 0xff00|uint16(format.mediaDescriptor))
 		binary.LittleEndian.PutUint16(fatTable[2:4], 0xffff)
 	default:
-		binary.LittleEndian.PutUint32(fatTable[0:4], fat32EndOfChain&0xffffff00|uint32(fatMediaFixedDisk))
+		binary.LittleEndian.PutUint32(fatTable[0:4], fat32EndOfChain&0xffffff00|uint32(format.mediaDescriptor))
 		binary.LittleEndian.PutUint32(fatTable[4:8], fat32EndOfChain)
 		binary.LittleEndian.PutUint32(fatTable[8:12], fat32EndOfChain)
 	}

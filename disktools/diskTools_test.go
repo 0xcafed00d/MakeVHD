@@ -376,6 +376,162 @@ func TestMakeVHDCreatesVHDWithFooter(t *testing.T) {
 	}
 }
 
+func TestMakeFloppyImageCreatesStandardLayouts(t *testing.T) {
+	tests := []struct {
+		name              string
+		totalSectors      uint32
+		sectorsPerTrack   uint16
+		headCount         uint16
+		sectorsPerCluster byte
+		reservedSectors   uint16
+		rootEntryCount    uint16
+		sectorsPerFAT     uint16
+		mediaDescriptor   byte
+	}{
+		{
+			name:              "160k",
+			totalSectors:      320,
+			sectorsPerTrack:   8,
+			headCount:         1,
+			sectorsPerCluster: 1,
+			reservedSectors:   1,
+			rootEntryCount:    64,
+			sectorsPerFAT:     1,
+			mediaDescriptor:   0xfe,
+		},
+		{
+			name:              "180k",
+			totalSectors:      360,
+			sectorsPerTrack:   9,
+			headCount:         1,
+			sectorsPerCluster: 1,
+			reservedSectors:   1,
+			rootEntryCount:    64,
+			sectorsPerFAT:     2,
+			mediaDescriptor:   0xfc,
+		},
+		{
+			name:              "320k",
+			totalSectors:      640,
+			sectorsPerTrack:   8,
+			headCount:         2,
+			sectorsPerCluster: 2,
+			reservedSectors:   1,
+			rootEntryCount:    112,
+			sectorsPerFAT:     1,
+			mediaDescriptor:   0xff,
+		},
+		{
+			name:              "360k",
+			totalSectors:      720,
+			sectorsPerTrack:   9,
+			headCount:         2,
+			sectorsPerCluster: 2,
+			reservedSectors:   1,
+			rootEntryCount:    112,
+			sectorsPerFAT:     2,
+			mediaDescriptor:   0xfd,
+		},
+		{
+			name:              "720k",
+			totalSectors:      1440,
+			sectorsPerTrack:   9,
+			headCount:         2,
+			sectorsPerCluster: 2,
+			reservedSectors:   1,
+			rootEntryCount:    112,
+			sectorsPerFAT:     3,
+			mediaDescriptor:   0xf9,
+		},
+		{
+			name:              "1200k",
+			totalSectors:      2400,
+			sectorsPerTrack:   15,
+			headCount:         2,
+			sectorsPerCluster: 1,
+			reservedSectors:   1,
+			rootEntryCount:    224,
+			sectorsPerFAT:     7,
+			mediaDescriptor:   0xf9,
+		},
+		{
+			name:              "1440k",
+			totalSectors:      2880,
+			sectorsPerTrack:   18,
+			headCount:         2,
+			sectorsPerCluster: 1,
+			reservedSectors:   1,
+			rootEntryCount:    224,
+			sectorsPerFAT:     9,
+			mediaDescriptor:   0xf0,
+		},
+		{
+			name:              "2880k",
+			totalSectors:      5760,
+			sectorsPerTrack:   36,
+			headCount:         2,
+			sectorsPerCluster: 2,
+			reservedSectors:   1,
+			rootEntryCount:    240,
+			sectorsPerFAT:     9,
+			mediaDescriptor:   0xf0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			imagePath := filepath.Join(t.TempDir(), tt.name+".img")
+			if err := MakeFloppyImage(imagePath, tt.name); err != nil {
+				t.Fatalf("MakeFloppyImage returned error: %v", err)
+			}
+
+			info, err := os.Stat(imagePath)
+			if err != nil {
+				t.Fatalf("Stat returned error: %v", err)
+			}
+
+			wantSize := int64(tt.totalSectors) * vhdSectorSize
+			if info.Size() != wantSize {
+				t.Fatalf("floppy image size = %d, want %d", info.Size(), wantSize)
+			}
+
+			boot := readBytesAt(t, imagePath, 0, vhdSectorSize)
+			assertFloppyBootSector(t, boot, tt.totalSectors, tt.sectorsPerTrack, tt.headCount, tt.sectorsPerCluster, tt.reservedSectors, tt.rootEntryCount, tt.sectorsPerFAT, tt.mediaDescriptor)
+			assertBootSignatureAtLBA(t, imagePath, 0)
+
+			firstFATOffset := int64(tt.reservedSectors) * vhdSectorSize
+			secondFATOffset := int64(tt.reservedSectors+tt.sectorsPerFAT) * vhdSectorSize
+			wantFATPrefix := []byte{tt.mediaDescriptor, 0xff, 0xff}
+			assertBytesAt(t, imagePath, firstFATOffset, wantFATPrefix)
+			assertBytesAt(t, imagePath, secondFATOffset, wantFATPrefix)
+		})
+	}
+}
+
+func TestMakeFloppyImageAcceptsUppercasePreset(t *testing.T) {
+	imagePath := filepath.Join(t.TempDir(), "floppy.img")
+
+	if err := MakeFloppyImage(imagePath, "1440K"); err != nil {
+		t.Fatalf("MakeFloppyImage returned error: %v", err)
+	}
+}
+
+func TestMakeFloppyImageRejectsUnsupportedPreset(t *testing.T) {
+	imagePath := filepath.Join(t.TempDir(), "floppy.img")
+
+	if err := MakeFloppyImage(imagePath, "123k"); err == nil {
+		t.Fatal("MakeFloppyImage returned nil error for unsupported preset")
+	}
+}
+
+func TestMakeFloppyImageRejectsVHD(t *testing.T) {
+	imagePath := filepath.Join(t.TempDir(), "floppy.vhd")
+
+	if err := MakeFloppyImage(imagePath, "1440k"); err == nil {
+		t.Fatal("MakeFloppyImage returned nil error for VHD filename")
+	}
+}
+
 func TestMakeVHDRejectsUnsupportedExtension(t *testing.T) {
 	imagePath := filepath.Join(t.TempDir(), "disk.raw")
 
@@ -541,4 +697,68 @@ func readFooter(t *testing.T, imagePath string) [vhdFooterSize]byte {
 	}
 
 	return footer
+}
+
+func assertFloppyBootSector(
+	t *testing.T,
+	boot []byte,
+	totalSectors uint32,
+	sectorsPerTrack uint16,
+	headCount uint16,
+	sectorsPerCluster byte,
+	reservedSectors uint16,
+	rootEntryCount uint16,
+	sectorsPerFAT uint16,
+	mediaDescriptor byte,
+) {
+	t.Helper()
+
+	if binary.LittleEndian.Uint16(boot[11:13]) != vhdSectorSize {
+		t.Fatalf("bytes per sector = %d, want %d", binary.LittleEndian.Uint16(boot[11:13]), vhdSectorSize)
+	}
+	if boot[13] != sectorsPerCluster {
+		t.Fatalf("sectors per cluster = %d, want %d", boot[13], sectorsPerCluster)
+	}
+	if binary.LittleEndian.Uint16(boot[14:16]) != reservedSectors {
+		t.Fatalf("reserved sectors = %d, want %d", binary.LittleEndian.Uint16(boot[14:16]), reservedSectors)
+	}
+	if boot[16] != fatCount {
+		t.Fatalf("FAT count = %d, want %d", boot[16], fatCount)
+	}
+	if binary.LittleEndian.Uint16(boot[17:19]) != rootEntryCount {
+		t.Fatalf("root entry count = %d, want %d", binary.LittleEndian.Uint16(boot[17:19]), rootEntryCount)
+	}
+	if binary.LittleEndian.Uint16(boot[19:21]) != uint16(totalSectors) {
+		t.Fatalf("total sectors 16 = %d, want %d", binary.LittleEndian.Uint16(boot[19:21]), totalSectors)
+	}
+	if boot[21] != mediaDescriptor {
+		t.Fatalf("media descriptor = %#x, want %#x", boot[21], mediaDescriptor)
+	}
+	if binary.LittleEndian.Uint16(boot[22:24]) != sectorsPerFAT {
+		t.Fatalf("sectors per FAT = %d, want %d", binary.LittleEndian.Uint16(boot[22:24]), sectorsPerFAT)
+	}
+	if binary.LittleEndian.Uint16(boot[24:26]) != sectorsPerTrack {
+		t.Fatalf("sectors per track = %d, want %d", binary.LittleEndian.Uint16(boot[24:26]), sectorsPerTrack)
+	}
+	if binary.LittleEndian.Uint16(boot[26:28]) != headCount {
+		t.Fatalf("head count = %d, want %d", binary.LittleEndian.Uint16(boot[26:28]), headCount)
+	}
+	if binary.LittleEndian.Uint32(boot[28:32]) != 0 {
+		t.Fatalf("hidden sectors = %d, want 0", binary.LittleEndian.Uint32(boot[28:32]))
+	}
+	if binary.LittleEndian.Uint32(boot[32:36]) != 0 {
+		t.Fatalf("total sectors 32 = %d, want 0", binary.LittleEndian.Uint32(boot[32:36]))
+	}
+	if boot[36] != fatDriveNumberFloppy {
+		t.Fatalf("drive number = %#x, want %#x", boot[36], fatDriveNumberFloppy)
+	}
+	if boot[38] != fatExtBootSignature {
+		t.Fatalf("extended boot signature = %#x, want %#x", boot[38], fatExtBootSignature)
+	}
+	if string(boot[43:54]) != fatVolumeLabel {
+		t.Fatalf("volume label = %q, want %q", string(boot[43:54]), fatVolumeLabel)
+	}
+	if string(boot[54:62]) != "FAT12   " {
+		t.Fatalf("filesystem type = %q, want %q", string(boot[54:62]), "FAT12   ")
+	}
 }
