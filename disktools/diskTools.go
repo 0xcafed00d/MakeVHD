@@ -14,6 +14,7 @@ import (
 
 const bytesPerMB = 1024 * 1024
 const maxImageSizeMB = 2048
+const fatBitsAuto = 0
 const maxFAT12SizeMB = 16
 const maxFAT16SizeMB = 512
 const minVHDSizeMB = 3
@@ -26,7 +27,7 @@ const mbrPartitionEntrySize = 16
 const mbrSignatureOffset = 510
 const vhdPartitionStartLBA = 2048
 const partitionTypeFAT12 = 0x01
-const partitionTypeFAT16LBA = 0x0e
+const partitionTypeFAT16B = 0x06
 const partitionTypeFAT32LBA = 0x0c
 const fatReservedSectors12_16 = 4
 const fatReservedSectors32 = 32
@@ -186,8 +187,18 @@ var floppyLayouts = map[string]floppyLayout{
 
 // MakeVHD creates either a FAT-formatted superfloppy IMG or a fixed VHD.
 func MakeVHD(filename string, size int) (err error) {
+	return MakeVHDWithFAT(filename, size, fatBitsAuto)
+}
+
+// MakeVHDWithFAT creates an image, optionally overriding the automatic FAT type.
+// Pass 0 for fatBits to keep the default size-based FAT selection.
+func MakeVHDWithFAT(filename string, size int, fatBits int) (err error) {
 	imageType, err := imageTypeFromFilename(filename)
 	if err != nil {
+		return err
+	}
+
+	if err := validateFATBitsOverride(fatBits); err != nil {
 		return err
 	}
 
@@ -197,17 +208,17 @@ func MakeVHD(filename string, size int) (err error) {
 	defer cleanupPartialImageOnError(filename, &err)
 
 	if imageType == imageExtIMG {
-		if err := FormatImage(filename, size); err != nil {
+		if err := FormatImageWithFAT(filename, size, fatBits); err != nil {
 			return fmt.Errorf("FormatImage: %w", err)
 		}
 		return nil
 	}
 
-	if err := writeMBR(filename, size); err != nil {
+	if err := writeMBRWithFAT(filename, size, fatBits); err != nil {
 		return fmt.Errorf("writeMBR: %w", err)
 	}
 
-	if err := FormatImage(filename, size); err != nil {
+	if err := FormatImageWithFAT(filename, size, fatBits); err != nil {
 		return fmt.Errorf("FormatImage: %w", err)
 	}
 
@@ -299,7 +310,17 @@ func CreateImage(filename string, size int) (err error) {
 
 // FormatImage writes a FAT filesystem into an existing raw disk image.
 func FormatImage(filename string, size int) error {
+	return FormatImageWithFAT(filename, size, fatBitsAuto)
+}
+
+// FormatImageWithFAT writes a FAT filesystem into an existing raw disk image.
+// Pass 0 for fatBits to keep the default size-based FAT selection.
+func FormatImageWithFAT(filename string, size int, fatBits int) error {
 	if err := validateImageSpec(filename, size); err != nil {
+		return err
+	}
+
+	if err := validateFATBitsOverride(fatBits); err != nil {
 		return err
 	}
 
@@ -331,12 +352,17 @@ func FormatImage(filename string, size int) error {
 			return fmt.Errorf("image file %q has size %d bytes, want %d bytes", filename, info.Size(), wantSize)
 		}
 
-		format, err = makeFATFormat(info.Size(), fatBitsForSize(size), 0, 0)
+		selectedFATBits, err := fatBitsForSizeOverride(size, fatBits)
+		if err != nil {
+			return err
+		}
+
+		format, err = makeFATFormat(info.Size(), selectedFATBits, 0, 0)
 		if err != nil {
 			return err
 		}
 	case imageExtVHD:
-		layout, err := layoutForVHD(size)
+		layout, err := layoutForVHDWithFAT(size, fatBits)
 		if err != nil {
 			return err
 		}
@@ -862,8 +888,34 @@ func fatBitsForSize(size int) int {
 	}
 }
 
+func fatBitsForSizeOverride(size int, fatBits int) (int, error) {
+	if fatBits == fatBitsAuto {
+		return fatBitsForSize(size), nil
+	}
+
+	if err := validateFATBitsOverride(fatBits); err != nil {
+		return 0, err
+	}
+
+	return fatBits, nil
+}
+
+func validateFATBitsOverride(fatBits int) error {
+	switch fatBits {
+	case fatBitsAuto, 12, 16, 32:
+		return nil
+	default:
+		return fmt.Errorf("invalid FAT type %d; supported FAT types: 12, 16, 32", fatBits)
+	}
+}
+
 // layoutForVHD calculates the disk and partition layout for a VHD image.
 func layoutForVHD(size int) (partitionLayout, error) {
+	return layoutForVHDWithFAT(size, fatBitsAuto)
+}
+
+// layoutForVHDWithFAT calculates the disk and partition layout for a VHD image.
+func layoutForVHDWithFAT(size int, fatBits int) (partitionLayout, error) {
 	var layout partitionLayout
 
 	if size < minVHDSizeMB {
@@ -878,14 +930,17 @@ func layoutForVHD(size int) (partitionLayout, error) {
 
 	partitionSectors := totalSectors - vhdPartitionStartLBA
 	partitionSizeMB := int((partitionSectors * vhdSectorSize) / bytesPerMB)
-	fatBits := fatBitsForSize(partitionSizeMB)
+	selectedFATBits, err := fatBitsForSizeOverride(partitionSizeMB, fatBits)
+	if err != nil {
+		return layout, err
+	}
 
 	layout.rawSize = rawSize
 	layout.totalSectors = uint32(totalSectors)
 	layout.startLBA = vhdPartitionStartLBA
 	layout.partitionSectors = uint32(partitionSectors)
-	layout.fatBits = fatBits
-	layout.partitionType = partitionTypeForFAT(fatBits)
+	layout.fatBits = selectedFATBits
+	layout.partitionType = partitionTypeForFAT(selectedFATBits)
 	return layout, nil
 }
 
@@ -895,7 +950,7 @@ func partitionTypeForFAT(fatBits int) byte {
 	case 12:
 		return partitionTypeFAT12
 	case 16:
-		return partitionTypeFAT16LBA
+		return partitionTypeFAT16B
 	default:
 		return partitionTypeFAT32LBA
 	}
@@ -903,7 +958,12 @@ func partitionTypeForFAT(fatBits int) byte {
 
 // writeMBR writes a single-partition MBR for a VHD image.
 func writeMBR(filename string, size int) error {
-	layout, err := layoutForVHD(size)
+	return writeMBRWithFAT(filename, size, fatBitsAuto)
+}
+
+// writeMBRWithFAT writes a single-partition MBR for a VHD image.
+func writeMBRWithFAT(filename string, size int, fatBits int) error {
+	layout, err := layoutForVHDWithFAT(size, fatBits)
 	if err != nil {
 		return err
 	}
