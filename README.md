@@ -27,6 +27,8 @@ Run the program with a filename and size in megabytes:
 ```bash
 go run . mydisk.img 64
 go run . mydisk.vhd 64
+go run . mydisk.vhd 64 --fat 12
+go run . mydisk.vhd 64 --fat=12
 ```
 
 To request a standard DOS floppy image, use an `.img` filename with `--floppy`:
@@ -42,6 +44,7 @@ Or build the binary first:
 ```bash
 go build .
 ./makevhd mydisk.vhd 64
+./makevhd mydisk.vhd 64 --fat 12
 ./makevhd floppy.img --floppy 1440k
 ```
 
@@ -50,6 +53,7 @@ Rules:
 - filename must end in `.img` or `.vhd`
 - maximum size is `2048 MB`
 - `.vhd` files must be at least `3 MB`
+- FAT type is selected automatically unless `--fat <12|16|32>` or `--fat=<12|16|32>` is provided
 - floppy images must use `.img`
 - floppy presets are selected with `--floppy <preset>` or `--floppy=<preset>`
 
@@ -176,7 +180,8 @@ go test ./...
 
 ## Notes
 
-- FAT type is selected automatically from the image size.
+- FAT type is selected automatically from the image size unless overridden with `--fat`.
+- `.vhd` FAT16 partitions use MBR partition type `0x06` for DOS 3.31+ compatibility.
 - FAT formatting is implemented in Go; no external formatter is required.
 - `.img` and `.vhd` are intentionally different formats.
 - `.vhd` is a disk image with a partition table.

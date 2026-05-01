@@ -120,7 +120,48 @@ func TestFormatImageWritesFAT16BootSector(t *testing.T) {
 		t.Fatalf("layoutForVHD returned error: %v", err)
 	}
 
+	assertPartitionType(t, imagePath, 0x06)
 	assertFilesystemTypeAtLBA(t, imagePath, int64(layout.startLBA), 54, "FAT16   ")
+	assertBootSignatureAtLBA(t, imagePath, int64(layout.startLBA))
+	assertHiddenSectors(t, imagePath, int64(layout.startLBA), layout.startLBA)
+}
+
+func TestFormatImageWithFATOverridesSuperFloppyDefault(t *testing.T) {
+	imagePath := filepath.Join(t.TempDir(), "fat12.img")
+	if err := CreateImage(imagePath, 64); err != nil {
+		t.Fatalf("CreateImage returned error: %v", err)
+	}
+
+	if err := FormatImageWithFAT(imagePath, 64, 12); err != nil {
+		t.Fatalf("FormatImageWithFAT returned error: %v", err)
+	}
+
+	assertFilesystemTypeAtLBA(t, imagePath, 0, 54, "FAT12   ")
+	assertBootSignatureAtLBA(t, imagePath, 0)
+	assertHiddenSectors(t, imagePath, 0, 0)
+}
+
+func TestFormatImageWithFATOverridesVHDDefault(t *testing.T) {
+	imagePath := filepath.Join(t.TempDir(), "fat12.vhd")
+	if err := CreateImage(imagePath, 64); err != nil {
+		t.Fatalf("CreateImage returned error: %v", err)
+	}
+
+	if err := writeMBRWithFAT(imagePath, 64, 12); err != nil {
+		t.Fatalf("writeMBRWithFAT returned error: %v", err)
+	}
+
+	if err := FormatImageWithFAT(imagePath, 64, 12); err != nil {
+		t.Fatalf("FormatImageWithFAT returned error: %v", err)
+	}
+
+	layout, err := layoutForVHDWithFAT(64, 12)
+	if err != nil {
+		t.Fatalf("layoutForVHDWithFAT returned error: %v", err)
+	}
+
+	assertMBRPartition(t, imagePath, layout)
+	assertFilesystemTypeAtLBA(t, imagePath, int64(layout.startLBA), 54, "FAT12   ")
 	assertBootSignatureAtLBA(t, imagePath, int64(layout.startLBA))
 	assertHiddenSectors(t, imagePath, int64(layout.startLBA), layout.startLBA)
 }
@@ -247,6 +288,14 @@ func TestFormatImageRejectsUnexpectedFileSize(t *testing.T) {
 	}
 }
 
+func TestFormatImageWithFATRejectsInvalidFATType(t *testing.T) {
+	imagePath := filepath.Join(t.TempDir(), "disk.img")
+
+	if err := FormatImageWithFAT(imagePath, 8, 8); err == nil {
+		t.Fatal("FormatImageWithFAT returned nil error for invalid FAT type")
+	}
+}
+
 func TestConvertToVHDAppendsValidFooter(t *testing.T) {
 	imagePath := filepath.Join(t.TempDir(), "disk.vhd")
 	if err := CreateImage(imagePath, 8); err != nil {
@@ -369,6 +418,26 @@ func TestMakeVHDCreatesVHDWithFooter(t *testing.T) {
 	assertFilesystemTypeAtLBA(t, imagePath, int64(layout.startLBA), 54, "FAT12   ")
 	assertBootSignatureAtLBA(t, imagePath, int64(layout.startLBA))
 	assertHiddenSectors(t, imagePath, int64(layout.startLBA), layout.startLBA)
+
+	footer := readFooter(t, imagePath)
+	if !isValidVHDFooter(footer[:]) {
+		t.Fatal("footer checksum validation failed")
+	}
+}
+
+func TestMakeVHDWithFATOverridesDefault(t *testing.T) {
+	imagePath := filepath.Join(t.TempDir(), "disk.vhd")
+	if err := MakeVHDWithFAT(imagePath, 64, 12); err != nil {
+		t.Fatalf("MakeVHDWithFAT returned error: %v", err)
+	}
+
+	layout, err := layoutForVHDWithFAT(64, 12)
+	if err != nil {
+		t.Fatalf("layoutForVHDWithFAT returned error: %v", err)
+	}
+
+	assertMBRPartition(t, imagePath, layout)
+	assertFilesystemTypeAtLBA(t, imagePath, int64(layout.startLBA), 54, "FAT12   ")
 
 	footer := readFooter(t, imagePath)
 	if !isValidVHDFooter(footer[:]) {
@@ -646,6 +715,16 @@ func assertMBRPartition(t *testing.T, imagePath string, layout partitionLayout) 
 	sectorCount := binary.LittleEndian.Uint32(entry[12:16])
 	if sectorCount != layout.partitionSectors {
 		t.Fatalf("partition sector count = %d, want %d", sectorCount, layout.partitionSectors)
+	}
+}
+
+func assertPartitionType(t *testing.T, imagePath string, want byte) {
+	t.Helper()
+
+	sector0 := readBytesAt(t, imagePath, 0, mbrSize)
+	got := sector0[mbrPartitionTableOffset+4]
+	if got != want {
+		t.Fatalf("partition type = %#x, want %#x", got, want)
 	}
 }
 

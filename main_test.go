@@ -21,6 +21,36 @@ func TestParseCommandLineMegabyteImage(t *testing.T) {
 	}
 }
 
+func TestParseCommandLineFATOption(t *testing.T) {
+	command, err := parseCommandLine([]string{"disk.vhd", "64", "--fat", "32"})
+	if err != nil {
+		t.Fatalf("parseCommandLine returned error: %v", err)
+	}
+
+	if command.kind != commandKindImage {
+		t.Fatalf("command kind = %d, want %d", command.kind, commandKindImage)
+	}
+
+	if command.sizeMB != 64 {
+		t.Fatalf("sizeMB = %d, want 64", command.sizeMB)
+	}
+
+	if command.fatBits != 32 {
+		t.Fatalf("fatBits = %d, want 32", command.fatBits)
+	}
+}
+
+func TestParseCommandLineFATOptionEqualsForm(t *testing.T) {
+	command, err := parseCommandLine([]string{"disk.vhd", "--fat=16", "64"})
+	if err != nil {
+		t.Fatalf("parseCommandLine returned error: %v", err)
+	}
+
+	if command.fatBits != 16 {
+		t.Fatalf("fatBits = %d, want 16", command.fatBits)
+	}
+}
+
 func TestParseCommandLineFloppyPreset(t *testing.T) {
 	command, err := parseCommandLine([]string{"floppy.img", "--floppy", "1440k"})
 	if err != nil {
@@ -89,6 +119,24 @@ func TestParseCommandLineFloppyPresetAliases(t *testing.T) {
 func TestParseCommandLineRejectsInvalidSize(t *testing.T) {
 	if _, err := parseCommandLine([]string{"disk.img", "1440k"}); err == nil {
 		t.Fatal("parseCommandLine returned nil error for invalid size")
+	}
+}
+
+func TestParseCommandLineRejectsInvalidFATOption(t *testing.T) {
+	if _, err := parseCommandLine([]string{"disk.img", "64", "--fat", "8"}); err == nil {
+		t.Fatal("parseCommandLine returned nil error for invalid FAT type")
+	}
+}
+
+func TestParseCommandLineRejectsFATOptionWithoutValue(t *testing.T) {
+	if _, err := parseCommandLine([]string{"disk.img", "64", "--fat"}); err == nil {
+		t.Fatal("parseCommandLine returned nil error for missing FAT type")
+	}
+}
+
+func TestParseCommandLineRejectsFloppyWithFATOption(t *testing.T) {
+	if _, err := parseCommandLine([]string{"floppy.img", "--floppy=1440k", "--fat=12"}); err == nil {
+		t.Fatal("parseCommandLine returned nil error for floppy FAT override")
 	}
 }
 

@@ -59,6 +59,7 @@ type commandLine struct {
 	kind         commandKind
 	filename     string
 	sizeMB       int
+	fatBits      int
 	floppyPreset string
 }
 
@@ -76,27 +77,85 @@ func main() {
 }
 
 func parseCommandLine(args []string) (commandLine, error) {
-	switch {
-	case len(args) == 2:
-		if preset, ok := strings.CutPrefix(args[1], "--floppy="); ok {
-			return parseFloppyCommand(args[0], preset)
-		}
-
-		size, err := strconv.Atoi(args[1])
-		if err != nil {
-			return commandLine{}, fmt.Errorf("invalid size %q: %w", args[1], err)
-		}
-
-		return commandLine{
-			kind:     commandKindImage,
-			filename: args[0],
-			sizeMB:   size,
-		}, nil
-	case len(args) == 3 && args[1] == "--floppy":
-		return parseFloppyCommand(args[0], args[2])
-	default:
+	if len(args) < 2 {
 		return commandLine{}, fmt.Errorf("invalid arguments")
 	}
+
+	if preset, ok := strings.CutPrefix(args[1], "--floppy="); ok {
+		if len(args) != 2 {
+			return commandLine{}, fmt.Errorf("--floppy cannot be combined with other options")
+		}
+		return parseFloppyCommand(args[0], preset)
+	}
+
+	if args[1] == "--floppy" {
+		if len(args) != 3 {
+			return commandLine{}, fmt.Errorf("invalid arguments")
+		}
+		return parseFloppyCommand(args[0], args[2])
+	}
+
+	return parseImageCommand(args[0], args[1:])
+}
+
+func parseImageCommand(filename string, args []string) (commandLine, error) {
+	var sizeMB int
+	var hasSize bool
+	var fatBits int
+
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+
+		if value, ok := strings.CutPrefix(arg, "--fat="); ok {
+			parsedFATBits, err := parseFATBits(value)
+			if err != nil {
+				return commandLine{}, err
+			}
+			fatBits = parsedFATBits
+			continue
+		}
+
+		if arg == "--fat" {
+			index++
+			if index >= len(args) {
+				return commandLine{}, fmt.Errorf("--fat requires 12, 16, or 32")
+			}
+
+			parsedFATBits, err := parseFATBits(args[index])
+			if err != nil {
+				return commandLine{}, err
+			}
+			fatBits = parsedFATBits
+			continue
+		}
+
+		if strings.HasPrefix(arg, "--") {
+			return commandLine{}, fmt.Errorf("unknown option %q", arg)
+		}
+
+		if hasSize {
+			return commandLine{}, fmt.Errorf("invalid arguments")
+		}
+
+		size, err := strconv.Atoi(arg)
+		if err != nil {
+			return commandLine{}, fmt.Errorf("invalid size %q: %w", arg, err)
+		}
+
+		sizeMB = size
+		hasSize = true
+	}
+
+	if !hasSize {
+		return commandLine{}, fmt.Errorf("invalid arguments")
+	}
+
+	return commandLine{
+		kind:     commandKindImage,
+		filename: filename,
+		sizeMB:   sizeMB,
+		fatBits:  fatBits,
+	}, nil
 }
 
 func parseFloppyCommand(filename, preset string) (commandLine, error) {
@@ -121,10 +180,24 @@ func normalizeFloppyPreset(preset string) (string, bool) {
 	return canonicalPreset, ok
 }
 
+func parseFATBits(value string) (int, error) {
+	fatBits, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, fmt.Errorf("invalid FAT type %q: %w", value, err)
+	}
+
+	switch fatBits {
+	case 12, 16, 32:
+		return fatBits, nil
+	default:
+		return 0, fmt.Errorf("invalid FAT type %d; supported FAT types: 12, 16, 32", fatBits)
+	}
+}
+
 func runCommand(command commandLine) error {
 	switch command.kind {
 	case commandKindImage:
-		return disktools.MakeVHD(command.filename, command.sizeMB)
+		return disktools.MakeVHDWithFAT(command.filename, command.sizeMB, command.fatBits)
 	case commandKindFloppy:
 		return disktools.MakeFloppyImage(command.filename, command.floppyPreset)
 	default:
@@ -141,5 +214,5 @@ func (command commandLine) actionName() string {
 }
 
 func usage(program string) string {
-	return fmt.Sprintf("usage:\n  %s <filename(.img|.vhd)> <size (MB)>\n  %s <filename(.img)> --floppy <%s>\n\nfloppy aliases: %s", program, program, floppyPresetUsage, floppyAliasUsage)
+	return fmt.Sprintf("usage:\n  %s <filename(.img|.vhd)> <size (MB)> [--fat <12|16|32>]\n  %s <filename(.img|.vhd)> <size (MB)> [--fat=<12|16|32>]\n  %s <filename(.img)> --floppy <%s>\n\nfloppy aliases: %s", program, program, program, floppyPresetUsage, floppyAliasUsage)
 }
