@@ -55,6 +55,40 @@ func TestParseCommandLineFloppyPresetEqualsForm(t *testing.T) {
 	}
 }
 
+func TestParseCommandLineMacImage(t *testing.T) {
+	command, err := parseCommandLine([]string{"mac.hfs", "--mac", "64"})
+	if err != nil {
+		t.Fatalf("parseCommandLine returned error: %v", err)
+	}
+
+	if command.kind != commandKindMac {
+		t.Fatalf("command kind = %d, want %d", command.kind, commandKindMac)
+	}
+
+	if command.filename != "mac.hfs" {
+		t.Fatalf("filename = %q, want %q", command.filename, "mac.hfs")
+	}
+
+	if command.sizeMB != 64 {
+		t.Fatalf("sizeMB = %d, want 64", command.sizeMB)
+	}
+}
+
+func TestParseCommandLineMacImageTrailingFlag(t *testing.T) {
+	command, err := parseCommandLine([]string{"mac.dsk", "32", "--mac"})
+	if err != nil {
+		t.Fatalf("parseCommandLine returned error: %v", err)
+	}
+
+	if command.kind != commandKindMac {
+		t.Fatalf("command kind = %d, want %d", command.kind, commandKindMac)
+	}
+
+	if command.sizeMB != 32 {
+		t.Fatalf("sizeMB = %d, want 32", command.sizeMB)
+	}
+}
+
 func TestParseCommandLineFloppyPresetAliases(t *testing.T) {
 	tests := []struct {
 		name string

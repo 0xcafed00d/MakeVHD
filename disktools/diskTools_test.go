@@ -376,6 +376,53 @@ func TestMakeVHDCreatesVHDWithFooter(t *testing.T) {
 	}
 }
 
+func TestMakeMacImageCreatesHFSPlusImage(t *testing.T) {
+	imagePath := filepath.Join(t.TempDir(), "Classic Disk.hfs")
+	if err := MakeMacImage(imagePath, 8); err != nil {
+		t.Fatalf("MakeMacImage returned error: %v", err)
+	}
+
+	info, err := os.Stat(imagePath)
+	if err != nil {
+		t.Fatalf("Stat returned error: %v", err)
+	}
+
+	const rawSize = int64(8 * bytesPerMB)
+	if info.Size() != rawSize {
+		t.Fatalf("Mac image size = %d, want %d", info.Size(), rawSize)
+	}
+
+	header := readBytesAt(t, imagePath, hfsPlusVolumeHeaderOffset, hfsPlusVolumeHeaderSize)
+	assertHFSPlusVolumeHeader(t, header, 8)
+
+	alternate := readBytesAt(t, imagePath, rawSize-hfsPlusAlternateVolumeHeaderOffset, hfsPlusVolumeHeaderSize)
+	if string(alternate[0:2]) != string(header[0:2]) {
+		t.Fatalf("alternate HFS+ signature = %x, want %x", alternate[0:2], header[0:2])
+	}
+
+	assertHFSPlusAllocationBitmap(t, imagePath, header)
+	assertHFSPlusCatalog(t, imagePath, header)
+}
+
+func TestMakeMacImageAcceptsSupportedExtensions(t *testing.T) {
+	for _, ext := range []string{".img", ".dsk", ".hfs"} {
+		t.Run(ext, func(t *testing.T) {
+			imagePath := filepath.Join(t.TempDir(), "mac"+ext)
+			if err := MakeMacImage(imagePath, 1); err != nil {
+				t.Fatalf("MakeMacImage returned error: %v", err)
+			}
+		})
+	}
+}
+
+func TestMakeMacImageRejectsUnsupportedExtension(t *testing.T) {
+	imagePath := filepath.Join(t.TempDir(), "mac.raw")
+
+	if err := MakeMacImage(imagePath, 8); err == nil {
+		t.Fatal("MakeMacImage returned nil error for unsupported filename extension")
+	}
+}
+
 func TestMakeFloppyImageCreatesStandardLayouts(t *testing.T) {
 	tests := []struct {
 		name              string
@@ -760,5 +807,106 @@ func assertFloppyBootSector(
 	}
 	if string(boot[54:62]) != "FAT12   " {
 		t.Fatalf("filesystem type = %q, want %q", string(boot[54:62]), "FAT12   ")
+	}
+}
+
+func assertHFSPlusVolumeHeader(t *testing.T, header []byte, sizeMB int) {
+	t.Helper()
+
+	if binary.BigEndian.Uint16(header[0:2]) != hfsPlusSignature {
+		t.Fatalf("HFS+ signature = %#x, want %#x", binary.BigEndian.Uint16(header[0:2]), hfsPlusSignature)
+	}
+	if binary.BigEndian.Uint16(header[2:4]) != hfsPlusVersion {
+		t.Fatalf("HFS+ version = %d, want %d", binary.BigEndian.Uint16(header[2:4]), hfsPlusVersion)
+	}
+	if binary.BigEndian.Uint32(header[4:8])&hfsPlusUnmountedMask == 0 {
+		t.Fatalf("HFS+ unmounted bit is not set in attributes %#x", binary.BigEndian.Uint32(header[4:8]))
+	}
+	if string(header[8:12]) != hfsPlusLastMountedVersion {
+		t.Fatalf("last mounted version = %q, want %q", string(header[8:12]), hfsPlusLastMountedVersion)
+	}
+	if binary.BigEndian.Uint32(header[40:44]) != hfsPlusBlockSize {
+		t.Fatalf("HFS+ block size = %d, want %d", binary.BigEndian.Uint32(header[40:44]), hfsPlusBlockSize)
+	}
+
+	wantBlocks := uint32((sizeMB * bytesPerMB) / hfsPlusBlockSize)
+	if binary.BigEndian.Uint32(header[44:48]) != wantBlocks {
+		t.Fatalf("HFS+ total blocks = %d, want %d", binary.BigEndian.Uint32(header[44:48]), wantBlocks)
+	}
+	if binary.BigEndian.Uint32(header[48:52]) == 0 {
+		t.Fatal("HFS+ free blocks = 0, want non-zero")
+	}
+}
+
+func assertHFSPlusAllocationBitmap(t *testing.T, imagePath string, header []byte) {
+	t.Helper()
+
+	allocationStart := binary.BigEndian.Uint32(header[hfsPlusVolumeHeaderAllocationForkOffset+16 : hfsPlusVolumeHeaderAllocationForkOffset+20])
+	allocationSize := binary.BigEndian.Uint64(header[hfsPlusVolumeHeaderAllocationForkOffset : hfsPlusVolumeHeaderAllocationForkOffset+8])
+	bitmap := readBytesAt(t, imagePath, int64(allocationStart)*hfsPlusBlockSize, int(allocationSize))
+
+	for _, block := range []uint32{0, allocationStart, allocationStart + 1, allocationStart + 2} {
+		if !hfsPlusAllocationBitIsSet(bitmap, block) {
+			t.Fatalf("allocation bit for block %d is clear, want set", block)
+		}
+	}
+
+	totalBlocks := binary.BigEndian.Uint32(header[44:48])
+	if !hfsPlusAllocationBitIsSet(bitmap, totalBlocks-1) {
+		t.Fatalf("allocation bit for last block %d is clear, want set", totalBlocks-1)
+	}
+}
+
+func hfsPlusAllocationBitIsSet(bitmap []byte, block uint32) bool {
+	return bitmap[block/8]&(1<<(7-(block%8))) != 0
+}
+
+func assertHFSPlusCatalog(t *testing.T, imagePath string, header []byte) {
+	t.Helper()
+
+	catalogStart := binary.BigEndian.Uint32(header[hfsPlusVolumeHeaderCatalogForkOffset+16 : hfsPlusVolumeHeaderCatalogForkOffset+20])
+	catalogOffset := int64(catalogStart) * hfsPlusBlockSize
+	headerNode := readBytesAt(t, imagePath, catalogOffset, hfsPlusCatalogNodeSize)
+
+	if headerNode[8] != hfsPlusBTreeHeaderNodeKind {
+		t.Fatalf("catalog header node kind = %#x, want %#x", headerNode[8], hfsPlusBTreeHeaderNodeKind)
+	}
+	if binary.BigEndian.Uint16(headerNode[10:12]) != 3 {
+		t.Fatalf("catalog header records = %d, want 3", binary.BigEndian.Uint16(headerNode[10:12]))
+	}
+
+	treeHeader := headerNode[hfsPlusBTreeHeaderRecordOffset:]
+	if binary.BigEndian.Uint16(treeHeader[0:2]) != 1 {
+		t.Fatalf("catalog tree depth = %d, want 1", binary.BigEndian.Uint16(treeHeader[0:2]))
+	}
+	if binary.BigEndian.Uint32(treeHeader[2:6]) != 1 {
+		t.Fatalf("catalog root node = %d, want 1", binary.BigEndian.Uint32(treeHeader[2:6]))
+	}
+	if binary.BigEndian.Uint32(treeHeader[6:10]) != 2 {
+		t.Fatalf("catalog leaf records = %d, want 2", binary.BigEndian.Uint32(treeHeader[6:10]))
+	}
+
+	leaf := readBytesAt(t, imagePath, catalogOffset+hfsPlusCatalogNodeSize, hfsPlusCatalogNodeSize)
+	if leaf[8] != hfsPlusBTreeLeafNodeKind {
+		t.Fatalf("catalog leaf node kind = %#x, want %#x", leaf[8], hfsPlusBTreeLeafNodeKind)
+	}
+	if binary.BigEndian.Uint16(leaf[10:12]) != 2 {
+		t.Fatalf("catalog leaf records = %d, want 2", binary.BigEndian.Uint16(leaf[10:12]))
+	}
+
+	firstRecordOffset := binary.BigEndian.Uint16(leaf[hfsPlusCatalogNodeSize-2:])
+	secondRecordOffset := binary.BigEndian.Uint16(leaf[hfsPlusCatalogNodeSize-4:])
+	assertHFSPlusCatalogRecordType(t, leaf, firstRecordOffset, hfsPlusFolderRecord)
+	assertHFSPlusCatalogRecordType(t, leaf, secondRecordOffset, hfsPlusFolderThreadRecord)
+}
+
+func assertHFSPlusCatalogRecordType(t *testing.T, leaf []byte, recordOffset uint16, want uint16) {
+	t.Helper()
+
+	keyLength := binary.BigEndian.Uint16(leaf[recordOffset : recordOffset+2])
+	dataOffset := int(recordOffset) + 2 + int(keyLength)
+	got := binary.BigEndian.Uint16(leaf[dataOffset : dataOffset+2])
+	if got != want {
+		t.Fatalf("catalog record type = %#x, want %#x", got, want)
 	}
 }

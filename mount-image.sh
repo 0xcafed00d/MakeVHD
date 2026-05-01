@@ -4,11 +4,11 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: mount-image.sh <image(.img|.vhd)> <mount-point>
+Usage: mount-image.sh <image(.img|.dsk|.hfs|.vhd)> <mount-point>
 
 Mounts a makevhd-generated image on Linux.
 
-For .img files:
+For .img, .dsk, and .hfs files:
   - mounts the filesystem directly with loop
 
 For .vhd files:
@@ -17,6 +17,7 @@ For .vhd files:
 
 Examples:
   sudo ./mount-image.sh ./disk.img /mnt/disk
+  sudo ./mount-image.sh ./macdisk.hfs /mnt/disk
   sudo ./mount-image.sh ./disk.vhd /mnt/disk
 EOF
 }
@@ -64,7 +65,7 @@ attach_loop_with_partscan() {
 trap cleanup_on_error ERR
 
 case "${image_path##*.}" in
-    img|IMG)
+    img|IMG|dsk|DSK|hfs|HFS)
         mount -o loop "$image_path" "$mount_point"
         echo "mounted $image_path at $mount_point"
         echo "unmount with: sudo umount \"$mount_point\""

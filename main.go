@@ -15,6 +15,7 @@ type commandKind int
 const (
 	commandKindImage commandKind = iota
 	commandKindFloppy
+	commandKindMac
 )
 
 const floppyPresetUsage = "160k|180k|320k|360k|720k|1200k|1440k|2880k"
@@ -82,9 +83,9 @@ func parseCommandLine(args []string) (commandLine, error) {
 			return parseFloppyCommand(args[0], preset)
 		}
 
-		size, err := strconv.Atoi(args[1])
+		size, err := parseSizeMB(args[1])
 		if err != nil {
-			return commandLine{}, fmt.Errorf("invalid size %q: %w", args[1], err)
+			return commandLine{}, err
 		}
 
 		return commandLine{
@@ -94,9 +95,22 @@ func parseCommandLine(args []string) (commandLine, error) {
 		}, nil
 	case len(args) == 3 && args[1] == "--floppy":
 		return parseFloppyCommand(args[0], args[2])
+	case len(args) == 3 && args[1] == "--mac":
+		return parseMacCommand(args[0], args[2])
+	case len(args) == 3 && args[2] == "--mac":
+		return parseMacCommand(args[0], args[1])
 	default:
 		return commandLine{}, fmt.Errorf("invalid arguments")
 	}
+}
+
+func parseSizeMB(value string) (int, error) {
+	size, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, fmt.Errorf("invalid size %q: %w", value, err)
+	}
+
+	return size, nil
 }
 
 func parseFloppyCommand(filename, preset string) (commandLine, error) {
@@ -116,6 +130,19 @@ func parseFloppyCommand(filename, preset string) (commandLine, error) {
 	}, nil
 }
 
+func parseMacCommand(filename, sizeValue string) (commandLine, error) {
+	size, err := parseSizeMB(sizeValue)
+	if err != nil {
+		return commandLine{}, err
+	}
+
+	return commandLine{
+		kind:     commandKindMac,
+		filename: filename,
+		sizeMB:   size,
+	}, nil
+}
+
 func normalizeFloppyPreset(preset string) (string, bool) {
 	canonicalPreset, ok := floppyPresetAliases[strings.ToLower(preset)]
 	return canonicalPreset, ok
@@ -127,19 +154,24 @@ func runCommand(command commandLine) error {
 		return disktools.MakeVHD(command.filename, command.sizeMB)
 	case commandKindFloppy:
 		return disktools.MakeFloppyImage(command.filename, command.floppyPreset)
+	case commandKindMac:
+		return disktools.MakeMacImage(command.filename, command.sizeMB)
 	default:
 		return fmt.Errorf("unknown command kind %d", command.kind)
 	}
 }
 
 func (command commandLine) actionName() string {
-	if command.kind == commandKindFloppy {
+	switch command.kind {
+	case commandKindFloppy:
 		return "MakeFloppyImage"
+	case commandKindMac:
+		return "MakeMacImage"
+	default:
+		return "MakeVHD"
 	}
-
-	return "MakeVHD"
 }
 
 func usage(program string) string {
-	return fmt.Sprintf("usage:\n  %s <filename(.img|.vhd)> <size (MB)>\n  %s <filename(.img)> --floppy <%s>\n\nfloppy aliases: %s", program, program, floppyPresetUsage, floppyAliasUsage)
+	return fmt.Sprintf("usage:\n  %s <filename(.img|.vhd)> <size (MB)>\n  %s <filename(.img)> --floppy <%s>\n  %s <filename(.img|.dsk|.hfs)> --mac <size (MB)>\n\nfloppy aliases: %s", program, program, floppyPresetUsage, program, floppyAliasUsage)
 }
